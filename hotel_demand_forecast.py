@@ -753,6 +753,18 @@ with tab_fcast:
                          tooltip=["stay_date:T",
                                   alt.Tooltip("total_revenue:Q",format=",.0f",title="Total Forecast")]))
         st.altair_chart(bar_rev + cap_c, use_container_width=True)
+        # Table: one row per stay_date with otb_revenue & pickup_revenue as columns
+        rev_tbl = rev_bar.copy()
+        rev_tbl["stay_date"] = rev_tbl["stay_date"].dt.strftime("%Y-%m-%d")
+        rev_tbl = rev_tbl.rename(columns={
+            "stay_date": "Stay Date",
+            "otb_revenue": "OTB Revenue (Confirmed)",
+            "pickup_revenue": "Pickup Revenue (Predicted)",
+        })
+        rev_tbl["OTB Revenue (Confirmed)"] = rev_tbl["OTB Revenue (Confirmed)"].apply(lambda x: f"{x:,.0f}")
+        rev_tbl["Pickup Revenue (Predicted)"] = rev_tbl["Pickup Revenue (Predicted)"].apply(lambda x: f"{x:,.0f}")
+        with st.expander("📊 View nightly revenue table (OTB vs Pickup by date)"):
+            st.dataframe(rev_tbl, use_container_width=True, height=300)
 
         # ── Occupancy: OTB + Pickup stacked + capacity ceiling ────────────────
         st.markdown("**Occupancy %: OTB (confirmed) vs Pickup (model prediction)**")
