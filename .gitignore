@@ -66,3 +66,6 @@ htmlcov/
 # models/
 # *.csv
 # *.pkl
+
+# Per-user session store (SQLite)
+users.db

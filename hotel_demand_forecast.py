@@ -26,6 +26,8 @@ import numpy as np
 import warnings
 from datetime import timedelta
 
+from user_session import init_db, load_session, save_session, list_users
+
 warnings.filterwarnings("ignore")
 
 # ── Page config ────────────────────────────────────────────────────────────────
@@ -626,6 +628,8 @@ def forecast_otb_anchored(ts_models, feat_cols, daily, otb_df, horizon=30):
 # ══════════════════════════════════════════════════════════════════════════════
 # SESSION STATE
 # ══════════════════════════════════════════════════════════════════════════════
+if "current_user" not in st.session_state:
+    st.session_state.current_user = None
 for k in ("ts_models","ts_metrics","ts_feat_cols","ts_df","daily",
           "m_cancel","cancel_metrics","m_los","los_metrics","raw","expanded"):
     if k not in st.session_state:
@@ -646,6 +650,32 @@ st.markdown("""
 # SIDEBAR
 # ══════════════════════════════════════════════════════════════════════════════
 with st.sidebar:
+    st.markdown("## 👤 User Session")
+    if st.session_state.current_user is None:
+        username_input = st.text_input("Username", placeholder="Enter your username", key="username_in")
+        if st.button("Load / Create session", type="primary", use_container_width=True, key="load_session_btn"):
+            if username_input and username_input.strip():
+                uname = username_input.strip()
+                st.session_state.current_user = uname
+                loaded = load_session(uname)
+                if loaded:
+                    for k, v in loaded.items():
+                        st.session_state[k] = v
+                    st.success(f"Loaded session for **{uname}**")
+                else:
+                    st.info(f"New session for **{uname}**. Upload data and train to save.")
+                st.rerun()
+            else:
+                st.warning("Enter a username first.")
+    else:
+        st.success(f"**{st.session_state.current_user}**")
+        if st.button("Switch User", use_container_width=True, key="switch_user_btn"):
+            st.session_state.current_user = None
+            for k in ("ts_models","ts_metrics","ts_feat_cols","ts_df","daily",
+                      "m_cancel","cancel_metrics","m_los","los_metrics","raw","expanded"):
+                st.session_state[k] = None
+            st.rerun()
+    st.markdown("---")
     st.markdown("## ⚙️ Controls")
     uploaded = st.file_uploader("📂 Upload Bookings CSV", type=["csv"])
     st.markdown("---")
@@ -743,6 +773,8 @@ with st.sidebar:
             st.session_state.los_metrics    = los_met
             st.session_state.raw            = raw_proc
             st.session_state.expanded       = expanded
+            if st.session_state.current_user:
+                save_session(st.session_state.current_user, dict(st.session_state))
             prog.empty()
             st.success("✅ All 12 models trained!")
 
