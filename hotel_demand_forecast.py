@@ -858,22 +858,23 @@ with tab_fcast:
                        tooltip=["stay_date:T","Room:N",alt.Tooltip("Occ %:Q",format=".1f")])
                .properties(height=260))
         st.altair_chart(rtc, use_container_width=True)
-        # Table: one row per stay_date with Standard, Deluxe, Suite as columns
-        rt_tbl = fcast[["stay_date", "total_std_occ", "total_dlx_occ", "total_ste_occ"]].copy()
-        rt_tbl["stay_date"] = rt_tbl["stay_date"].dt.strftime("%Y-%m-%d")
-        rt_tbl = rt_tbl.rename(columns={
-            "stay_date": "Stay Date",
-            "total_std_occ": "Standard",
-            "total_dlx_occ": "Deluxe",
-            "total_ste_occ": "Suite",
-        })
-        for c in ["Standard", "Deluxe", "Suite"]:
-            rt_tbl[c] = rt_tbl[c].apply(lambda x: f"{x:.1f}%")
-        with st.expander("📊 View occupancy by room type table"):
-            st.dataframe(rt_tbl, use_container_width=True, height=300)
 
     except ImportError:
         st.line_chart(fcast.set_index("stay_date")[["otb_occ_pct","pickup_occ_pct","total_occ_pct"]])
+
+    # Room type table: always show (outside try so it appears even if charts hit an error)
+    rt_tbl = fcast[["stay_date", "total_std_occ", "total_dlx_occ", "total_ste_occ"]].copy()
+    rt_tbl["stay_date"] = rt_tbl["stay_date"].dt.strftime("%Y-%m-%d")
+    rt_tbl = rt_tbl.rename(columns={
+        "stay_date": "Stay Date",
+        "total_std_occ": "Standard",
+        "total_dlx_occ": "Deluxe",
+        "total_ste_occ": "Suite",
+    })
+    for c in ["Standard", "Deluxe", "Suite"]:
+        rt_tbl[c] = rt_tbl[c].apply(lambda x: f"{x:.1f}%")
+    with st.expander("📊 View occupancy by room type table"):
+        st.dataframe(rt_tbl, use_container_width=True, height=300)
 
     # ── Per-date table ────────────────────────────────────────────────────────
     st.markdown('<p class="sec">📋 Daily Forecast Detail</p>', unsafe_allow_html=True)
