@@ -546,16 +546,26 @@ with st.sidebar:
     st.markdown("### 📅 Forecast Settings")
     horizon    = st.slider("Horizon (days)", 7, 180, 30, 7)
 
-    # as_of_date: default = last booking date in data (simulated "today")
+    # as_of_date: default = last booking date in uploaded/trained data (simulated "today")
     st.markdown("**As-of Date** *(simulated 'today')*")
     st.caption("OTB uses confirmed bookings made on or before this date.")
-    if st.session_state.raw is not None:
+    import datetime
+    if uploaded is not None:
+        try:
+            df_peek = pd.read_csv(uploaded)
+            df_peek["Booking_Date"] = pd.to_datetime(df_peek["Booking_Date"])
+            max_bk = df_peek["Booking_Date"].max().date()
+            min_bk = df_peek["Booking_Date"].min().date()
+            uploaded.seek(0)  # reset so Train can read the file again
+        except Exception:
+            max_bk = datetime.date.today()
+            min_bk = datetime.date(2020, 1, 1)
+    elif st.session_state.raw is not None:
         max_bk = st.session_state.raw["Booking_Date"].max().date()
         min_bk = st.session_state.raw["Booking_Date"].min().date()
     else:
-        import datetime
         max_bk = datetime.date.today()
-        min_bk = datetime.date(2020,1,1)
+        min_bk = datetime.date(2020, 1, 1)
     as_of_date = st.date_input("As-of Date", value=max_bk,
                                 min_value=min_bk, max_value=max_bk)
     as_of_ts = pd.Timestamp(as_of_date)
