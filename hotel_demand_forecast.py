@@ -47,7 +47,7 @@ st.markdown("""
     box-shadow:0 2px 10px rgba(0,0,0,.07);text-align:center;
     border-left:4px solid #0f3460;height:100%;}
   .kpi .v{font-size:1.6rem;font-weight:700;color:#0f3460;margin:0;line-height:1.2;}
-  .kpi .l{font-size:.75rem;color:#999;margin:.25rem 0 0;}
+  .kpi .l{font-size:.75rem;color:#333;margin:.25rem 0 0;}
   .kpi.g .v{color:#27ae60;}.kpi.g{border-left-color:#27ae60;}
   .kpi.o .v{color:#e67e22;}.kpi.o{border-left-color:#e67e22;}
   .kpi.r .v{color:#e74c3c;}.kpi.r{border-left-color:#e74c3c;}
@@ -59,14 +59,15 @@ st.markdown("""
   .warn{background:#fff8f0;border-left:3px solid #e67e22;
     border-radius:8px;padding:.85rem 1rem;margin:.4rem 0;font-size:.88rem;}
   .otb-box{background:#e8f5e9;border-left:4px solid #27ae60;
-    border-radius:10px;padding:1rem 1.2rem;margin:.5rem 0;}
+    border-radius:10px;padding:1rem 1.2rem;margin:.5rem 0;color:#1b5e20;}
   .pickup-box{background:#fff3e0;border-left:4px solid #e67e22;
-    border-radius:10px;padding:1rem 1.2rem;margin:.5rem 0;}
+    border-radius:10px;padding:1rem 1.2rem;margin:.5rem 0;color:#e65100;}
   .total-box{background:#e8eaf6;border-left:4px solid #3949ab;
-    border-radius:10px;padding:1rem 1.2rem;margin:.5rem 0;}
-  .sec{font-size:1.1rem;font-weight:700;color:#1a1a2e;
+    border-radius:10px;padding:1rem 1.2rem;margin:.5rem 0;color:#1a237e;}
+  .sec{font-size:1.1rem;font-weight:700;color:#e8ecf4;
     margin:1.4rem 0 .7rem;padding-bottom:.3rem;
-    border-bottom:2px solid #e8ecf4;}
+    border-bottom:2px solid rgba(232,236,244,.4);}
+  .sec .sec-sub{color:rgba(232,236,244,.95);font-weight:400;font-size:.85rem;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -653,7 +654,7 @@ end_str      = (as_of_ts + timedelta(days=horizon)).strftime("%d %b %Y")
 # TOP KPI STRIP
 # ══════════════════════════════════════════════════════════════════════════════
 st.markdown(f'<p class="sec">📈 {horizon}-Day Outlook: {tomorrow_str} → {end_str} '
-            f'<span style="font-weight:400;font-size:.85rem;">(as of {as_of_date})</span></p>',
+            f'<span class="sec-sub">(as of {as_of_date})</span></p>',
             unsafe_allow_html=True)
 
 avg_otb_occ   = fcast["otb_occ_pct"].mean()
