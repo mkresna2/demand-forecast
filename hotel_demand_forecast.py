@@ -787,6 +787,18 @@ with tab_fcast:
                      .mark_rule(color="#e94560",strokeDash=[4,2],strokeWidth=1)
                      .encode(x="stay_date:T",y="cap:Q"))
         st.altair_chart(bar_occ + cap_line2, use_container_width=True)
+        # Table: one row per stay_date with OTB % & Pickup % as columns
+        occ_tbl = fcast[["stay_date", "otb_occ_pct", "pickup_occ_pct"]].copy()
+        occ_tbl["stay_date"] = occ_tbl["stay_date"].dt.strftime("%Y-%m-%d")
+        occ_tbl = occ_tbl.rename(columns={
+            "stay_date": "Stay Date",
+            "otb_occ_pct": "OTB Occ % (Confirmed)",
+            "pickup_occ_pct": "Pickup Occ % (Predicted)",
+        })
+        occ_tbl["OTB Occ % (Confirmed)"] = occ_tbl["OTB Occ % (Confirmed)"].apply(lambda x: f"{x:.1f}%")
+        occ_tbl["Pickup Occ % (Predicted)"] = occ_tbl["Pickup Occ % (Predicted)"].apply(lambda x: f"{x:.1f}%")
+        with st.expander("📊 View occupancy % table (OTB vs Pickup by date)"):
+            st.dataframe(occ_tbl, use_container_width=True, height=300)
 
         # ── Historical context + forecast line ────────────────────────────────
         st.markdown("**Historical Occupancy (last 90 days) + Total Forecast**")
