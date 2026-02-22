@@ -802,7 +802,13 @@ with tab_fcast:
 
         # ── Historical context + forecast line ────────────────────────────────
         st.markdown("**Historical Occupancy (last 90 days) + Total Forecast**")
-        hist_occ = daily.tail(90)[["stay_date","occ_pct_total"]].copy()
+        # Show actuals for the full range that overlaps the chart: from (forecast start − 90d) to forecast end,
+        # so April–Sep and all other actuals in the forecast window appear (not just the last 90 rows).
+        fcast_min = fcast["stay_date"].min()
+        fcast_max = fcast["stay_date"].max()
+        range_start = fcast_min - timedelta(days=90)
+        hist_mask = (daily["stay_date"] >= range_start) & (daily["stay_date"] <= fcast_max)
+        hist_occ = daily.loc[hist_mask, ["stay_date", "occ_pct_total"]].copy()
         hist_occ["series"] = "Historical (Actual)"
         fore_occ = fcast[["stay_date","total_occ_pct"]].rename(
             columns={"total_occ_pct":"occ_pct_total"}).copy()
