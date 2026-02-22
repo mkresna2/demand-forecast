@@ -831,6 +831,18 @@ with tab_fcast:
                       tooltip=["stay_date:T",alt.Tooltip("occ_pct_total:Q",format=".1f"),"series:N"])
               .properties(height=270))
         st.altair_chart(hf, use_container_width=True)
+        # Table: one row per date with Historical (Actual), OTB Only, Total Forecast
+        all_dates = pd.DataFrame({"stay_date": pd.date_range(start=range_start, end=fcast_max, freq="D")})
+        hist_df = daily.loc[hist_mask, ["stay_date", "occ_pct_total"]].rename(columns={"occ_pct_total": "Historical (Actual)"})
+        fore_df = fcast[["stay_date", "otb_occ_pct", "total_occ_pct"]].rename(
+            columns={"otb_occ_pct": "OTB Only", "total_occ_pct": "Total Forecast"})
+        hf_tbl = all_dates.merge(hist_df, on="stay_date", how="left").merge(fore_df, on="stay_date", how="left")
+        hf_tbl["stay_date"] = hf_tbl["stay_date"].dt.strftime("%Y-%m-%d")
+        hf_tbl = hf_tbl.rename(columns={"stay_date": "Stay Date"})
+        for c in ["Historical (Actual)", "OTB Only", "Total Forecast"]:
+            hf_tbl[c] = hf_tbl[c].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "")
+        with st.expander("📊 View historical + forecast occupancy table"):
+            st.dataframe(hf_tbl, use_container_width=True, height=350)
 
         # ── By room type ──────────────────────────────────────────────────────
         st.markdown("**Occupancy by Room Type (Total Forecast)**")
