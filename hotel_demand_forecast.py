@@ -55,9 +55,9 @@ st.markdown("""
   .kpi.t .v{color:#16a085;}.kpi.t{border-left-color:#16a085;}
   .insight{background:#f8f9ff;border-left:3px solid #0f3460;
     border-radius:8px;padding:.85rem 1rem;margin:.4rem 0;
-    font-size:.88rem;line-height:1.6;}
+    font-size:.88rem;line-height:1.6;color:#1a1a2e;}
   .warn{background:#fff8f0;border-left:3px solid #e67e22;
-    border-radius:8px;padding:.85rem 1rem;margin:.4rem 0;font-size:.88rem;}
+    border-radius:8px;padding:.85rem 1rem;margin:.4rem 0;font-size:.88rem;color:#1a1a2e;}
   .otb-box{background:#e8f5e9;border-left:4px solid #27ae60;
     border-radius:10px;padding:1rem 1.2rem;margin:.5rem 0;color:#1b5e20;}
   .pickup-box{background:#fff3e0;border-left:4px solid #e67e22;
@@ -235,10 +235,21 @@ def _add_time(df):
     df["is_weekend"]= (df["dow"] >= 5).astype(int)
     df["year"]      = df["stay_date"].dt.year
     df["dom"]       = df["stay_date"].dt.day
+    df["doy"]       = df["stay_date"].dt.dayofyear
+    # Cyclical encodings for seasonality
     df["month_sin"] = np.sin(2 * np.pi * df["month"] / 12)
     df["month_cos"] = np.cos(2 * np.pi * df["month"] / 12)
     df["dow_sin"]   = np.sin(2 * np.pi * df["dow"] / 7)
     df["dow_cos"]   = np.cos(2 * np.pi * df["dow"] / 7)
+    df["week_sin"]  = np.sin(2 * np.pi * df["week"] / 52)
+    df["week_cos"]  = np.cos(2 * np.pi * df["week"] / 52)
+    df["doy_sin"]   = np.sin(2 * np.pi * df["doy"] / 365)
+    df["doy_cos"]   = np.cos(2 * np.pi * df["doy"] / 365)
+    # Trend feature (days from start)
+    df["days_from_start"] = (df["stay_date"] - df["stay_date"].min()).dt.days
+    # Special periods
+    df["is_month_start"] = (df["dom"] <= 5).astype(int)
+    df["is_month_end"]   = (df["dom"] >= 25).astype(int)
     return df
 
 
@@ -246,11 +257,29 @@ def _add_lags(df, targets):
     df = df.copy()
     for t in targets:
         if t not in df.columns: continue
-        for lag in [1,2,3,7,14,21,28,30,60,90]:
+        # Extended lag features
+        for lag in [1,2,3,4,5,6,7,10,14,21,28,30,60,90,120,180,365]:
             df[f"{t}_lag{lag}"] = df[t].shift(lag)
-        for w in [3,7,14,30,60]:
-            df[f"{t}_roll{w}"]    = df[t].shift(1).rolling(w).mean()
-            df[f"{t}_roll{w}std"] = df[t].shift(1).rolling(w).std()
+        # Rolling statistics
+        for w in [3,5,7,14,21,30,60,90]:
+            df[f"{t}_roll{w}"]      = df[t].shift(1).rolling(w).mean()
+            df[f"{t}_roll{w}std"]   = df[t].shift(1).rolling(w).std()
+            df[f"{t}_roll{w}min"]   = df[t].shift(1).rolling(w).min()
+            df[f"{t}_roll{w}max"]   = df[t].shift(1).rolling(w).max()
+            df[f"{t}_roll{w}median"] = df[t].shift(1).rolling(w).median()
+        # Exponentially weighted moving averages (more weight to recent data)
+        for span in [3,7,14,30]:
+            df[f"{t}_ewma{span}"] = df[t].shift(1).ewm(span=span, adjust=False).mean()
+        # Differential features (rate of change)
+        for lag in [1,7,14,30]:
+            df[f"{t}_diff{lag}"] = df[t].diff(lag)
+            df[f"{t}_pct_chg{lag}"] = df[t].pct_change(lag).replace([np.inf, -np.inf], 0)
+        # Momentum: recent trend (short vs medium term)
+        df[f"{t}_momentum"] = df[f"{t}_roll7"] - df[f"{t}_roll30"]
+        # Seasonal comparison: same day last week, last month, last year
+        df[f"{t}_yoy"] = df[t].diff(365)  # Year-over-year
+        df[f"{t}_mom"] = df[t].diff(30)   # Month-over-month
+        df[f"{t}_wow"] = df[t].diff(7)    # Week-over-week
     return df
 
 
@@ -261,6 +290,7 @@ def _add_lags(df, targets):
 def train_ts_models(daily: pd.DataFrame):
     import lightgbm as lgb
     from sklearn.metrics import mean_absolute_error
+    from sklearn.preprocessing import StandardScaler
 
     all_ts_targets = TS_TARGETS + CHANNELS
     df = _add_time(daily)
@@ -281,13 +311,35 @@ def train_ts_models(daily: pd.DataFrame):
         Xtr, Xte = X.iloc[:split], X.iloc[split:]
         ytr, yte  = y.iloc[:split], y.iloc[split:]
 
-        m = lgb.LGBMRegressor(
-            n_estimators=2000, learning_rate=0.02, max_depth=7, num_leaves=63,
-            min_child_samples=5, subsample=0.8, colsample_bytree=0.8,
-            reg_alpha=0.05, reg_lambda=0.05, random_state=42, verbose=-1,
-        )
+        # Target-specific hyperparameters for better R2
+        if "occ_pct" in target:
+            # Occupancy needs stronger regularization due to bounded nature (0-100)
+            m = lgb.LGBMRegressor(
+                objective='regression',
+                n_estimators=3000, learning_rate=0.01, max_depth=5, num_leaves=31,
+                min_child_samples=20, subsample=0.7, colsample_bytree=0.7,
+                reg_alpha=0.5, reg_lambda=1.0, random_state=42, verbose=-1,
+                feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=5,
+            )
+        elif target in CHANNELS:
+            # Channel models
+            m = lgb.LGBMRegressor(
+                objective='regression',
+                n_estimators=2000, learning_rate=0.015, max_depth=6, num_leaves=47,
+                min_child_samples=10, subsample=0.75, colsample_bytree=0.75,
+                reg_alpha=0.2, reg_lambda=0.3, random_state=42, verbose=-1,
+            )
+        else:
+            # Revenue and ADR
+            m = lgb.LGBMRegressor(
+                objective='regression',
+                n_estimators=2500, learning_rate=0.015, max_depth=6, num_leaves=47,
+                min_child_samples=10, subsample=0.8, colsample_bytree=0.8,
+                reg_alpha=0.1, reg_lambda=0.2, random_state=42, verbose=-1,
+            )
+
         m.fit(Xtr, ytr, eval_set=[(Xte,yte)],
-              callbacks=[lgb.early_stopping(100, verbose=False)])
+              callbacks=[lgb.early_stopping(150, verbose=False)])
 
         preds = np.clip(m.predict(Xte), 0, None)
         if "occ_pct" in target: preds = np.minimum(preds, 100.0)
@@ -401,8 +453,18 @@ def forecast_otb_anchored(ts_models, feat_cols, daily, otb_df, horizon=30):
     """
     all_ts_targets = TS_TARGETS + CHANNELS
     df       = _add_time(daily).sort_values("stay_date").reset_index(drop=True)
-    history  = df.copy()
-    recent   = df.tail(30)
+
+    # Get recent averages for initialization (last 14 days of historical data)
+    recent   = df.tail(14)
+    recent_means = {}
+    for t in all_ts_targets + ["revpar","rooms_occupied",
+                               "rooms_Standard","rooms_Deluxe","rooms_Suite"]:
+        if t in recent.columns:
+            recent_means[t] = recent[t].mean()
+        else:
+            recent_means[t] = 0.0
+    for ch in CHANNELS:
+        recent_means[f"pct_{ch}"] = recent[f"pct_{ch}"].mean() if f"pct_{ch}" in recent.columns else 25.0
 
     static_cols = [c for c in df.columns
                    if c not in set(all_ts_targets) |
@@ -411,30 +473,74 @@ def forecast_otb_anchored(ts_models, feat_cols, daily, otb_df, horizon=30):
                    {f"pct_{ch}" for ch in CHANNELS}
                    and "_lag" not in c and "_roll" not in c]
 
+    # Pre-extend history with future dates, initialized with recent averages
+    # This ensures lag features have meaningful values, not zeros
+    future_rows = []
+    last_historical_date = df["stay_date"].max()
+    forecast_start = otb_df["stay_date"].min()
+
+    # Fill gap between last historical date and forecast start if any
+    gap_dates = pd.date_range(start=last_historical_date + timedelta(days=1),
+                               end=forecast_start - timedelta(days=1), freq='D')
+    for d in gap_dates:
+        row = {"stay_date": d}
+        for col in static_cols:
+            if col in recent.columns:
+                row[col] = recent[col].mean()
+        for t in all_ts_targets + ["revpar","rooms_occupied",
+                                   "rooms_Standard","rooms_Deluxe","rooms_Suite"]:
+            row[t] = recent_means[t]
+        for ch in CHANNELS:
+            row[f"pct_{ch}"] = recent_means[f"pct_{ch}"]
+        future_rows.append(row)
+
+    if future_rows:
+        df = pd.concat([df, pd.DataFrame(future_rows)], ignore_index=True)
+        df = df.sort_values("stay_date").reset_index(drop=True)
+
+    history  = df.copy()
+
     records = []
     for i, row_otb in otb_df.reset_index(drop=True).iterrows():
         next_date = pd.Timestamp(row_otb["stay_date"])
 
-        new_row = {"stay_date": next_date}
-        for col in static_cols:
-            if col in recent.columns:
-                new_row[col] = recent[col].mean()
-        for t in all_ts_targets + ["revpar","rooms_occupied",
-                                    "rooms_Standard","rooms_Deluxe","rooms_Suite"]:
-            new_row[t] = 0.0
-        for ch in CHANNELS:
-            new_row[f"pct_{ch}"] = 0.0
+        # Check if this date already exists (from gap filling)
+        if next_date in history["stay_date"].values:
+            # Update the existing row instead of creating new
+            idx = history[history["stay_date"] == next_date].index[0]
+        else:
+            # Create new row with recent averages as seeds
+            new_row = {"stay_date": next_date}
+            for col in static_cols:
+                if col in recent.columns:
+                    new_row[col] = recent[col].mean()
+            for t in all_ts_targets + ["revpar","rooms_occupied",
+                                       "rooms_Standard","rooms_Deluxe","rooms_Suite"]:
+                new_row[t] = recent_means[t]
+            for ch in CHANNELS:
+                new_row[f"pct_{ch}"] = recent_means[f"pct_{ch}"]
 
-        history = pd.concat([history, pd.DataFrame([new_row])], ignore_index=True)
+            history = pd.concat([history, pd.DataFrame([new_row])], ignore_index=True)
+            idx = history.index[-1]
+
+        # Recalculate all lag features with the full history
         history = _add_lags(history, all_ts_targets)
-        row_f   = history.iloc[[-1]][feat_cols].fillna(0)
+        row_f   = history.loc[[idx], feat_cols]
+
+        # Fill any remaining NaNs with recent means instead of zeros
+        for col in row_f.columns:
+            if row_f[col].isna().any():
+                if col in recent_means:
+                    row_f[col] = row_f[col].fillna(recent_means[col])
+                else:
+                    row_f[col] = row_f[col].fillna(0)
 
         model_pred = {}
         for t, m in ts_models.items():
             v = float(np.clip(m.predict(row_f)[0], 0, None))
             if "occ_pct" in t: v = min(v, 100.0)
             model_pred[t] = v
-            history.at[history.index[-1], t] = v
+            history.at[idx, t] = v
 
         # ── OTB values for this date ──────────────────────────────────────────
         otb_rooms   = float(row_otb["rooms_otb"])
@@ -545,12 +651,13 @@ with st.sidebar:
     st.markdown("---")
 
     st.markdown("### 📅 Forecast Settings")
-    horizon    = st.slider("Horizon (days)", 7, 180, 30, 7)
 
     # as_of_date: default = last booking date in uploaded/trained data (simulated "today")
     st.markdown("**As-of Date** *(simulated 'today')*")
     st.caption("OTB uses confirmed bookings made on or before this date.")
     import datetime
+    from dateutil.relativedelta import relativedelta
+
     if uploaded is not None:
         try:
             df_peek = pd.read_csv(uploaded)
@@ -570,6 +677,39 @@ with st.sidebar:
     as_of_date = st.date_input("As-of Date", value=max_bk,
                                 min_value=min_bk, max_value=max_bk)
     as_of_ts = pd.Timestamp(as_of_date)
+
+    # Generate month options starting from current month, extending 24 months out
+    today = datetime.date.today()
+    month_options = []
+    month_values = {}  # maps display label to (year, month)
+    for i in range(24):
+        month_date = today + relativedelta(months=i)
+        month_key = (month_date.year, month_date.month)
+        # Calculate days from tomorrow to end of this month
+        tomorrow = as_of_ts + timedelta(days=1)
+        month_start = pd.Timestamp(month_date.replace(day=1))
+        month_end = pd.Timestamp((month_date + relativedelta(months=1)).replace(day=1)) - timedelta(days=1)
+
+        # Only show months that have at least some days in the future from as_of_date
+        if month_end >= tomorrow:
+            label = month_date.strftime("%B %Y")  # e.g., "February 2026"
+            if i == 0:
+                label += " (current month)"
+            elif i == 1:
+                label += " (next month)"
+            month_options.append(label)
+            month_values[label] = (month_date.year, month_date.month, month_start, month_end)
+
+    default_month = month_options[0] if month_options else None
+    selected_month_label = st.selectbox("Forecast through month", month_options, index=0)
+
+    # Calculate horizon: days from tomorrow to end of selected month
+    tomorrow = as_of_ts + timedelta(days=1)
+    _, _, month_start, month_end = month_values[selected_month_label]
+    horizon = (month_end - tomorrow).days + 1  # +1 to include the last day of month
+    horizon = max(7, min(horizon, 365))  # clamp between 7 and 365 days
+
+    st.caption(f"Forecast horizon: {horizon} days (through {month_end.strftime('%d %b %Y')})")
 
     with st.expander("🏗️ Room Capacity"):
         CAPACITY["Standard"] = st.number_input("Standard rooms", 1, 500, 50)
@@ -649,11 +789,12 @@ with st.spinner("Computing OTB and generating forecast…"):
 
 tomorrow_str = (as_of_ts + timedelta(days=1)).strftime("%d %b %Y")
 end_str      = (as_of_ts + timedelta(days=horizon)).strftime("%d %b %Y")
+selected_month_name = selected_month_label.replace(" (current month)", "").replace(" (next month)", "")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TOP KPI STRIP
 # ══════════════════════════════════════════════════════════════════════════════
-st.markdown(f'<p class="sec">📈 {horizon}-Day Outlook: {tomorrow_str} → {end_str} '
+st.markdown(f'<p class="sec">📈 {selected_month_name} Forecast: {tomorrow_str} → {end_str} '
             f'<span class="sec-sub">(as of {as_of_date})</span></p>',
             unsafe_allow_html=True)
 
@@ -723,7 +864,7 @@ with tab_fcast:
     try:
         import altair as alt
 
-        # ── Revenue: OTB + Pickup stacked bar + historical line ────────────────
+        # ── Revenue: OTB + Pickup stacked bar + pickup line overlay ────────────────
         st.markdown("**Nightly Revenue: OTB (confirmed) vs Pickup (model prediction)**")
         rev_bar = fcast[["stay_date","otb_revenue","pickup_revenue"]].copy()
         rev_melt = rev_bar.melt("stay_date",var_name="Component",value_name="Revenue")
@@ -742,17 +883,21 @@ with tab_fcast:
                                     alt.Tooltip("Revenue:Q",format=",.0f"),"Component:N"])
                    .properties(height=300))
 
-        # Overlay total capacity line
-        cap_line = pd.DataFrame({
-            "stay_date": fcast["stay_date"],
-            "cap_revenue": CAPACITY["total"] * fcast["total_adr"],
-        })
-        cap_c = (alt.Chart(fcast).mark_line(color="#e94560",strokeDash=[4,2],strokeWidth=1.5)
-                 .encode(x="stay_date:T",
-                         y=alt.Y("total_revenue:Q",axis=alt.Axis(format="~s")),
-                         tooltip=["stay_date:T",
-                                  alt.Tooltip("total_revenue:Q",format=",.0f",title="Total Forecast")]))
-        st.altair_chart(bar_rev + cap_c, use_container_width=True)
+        # Pickup line overlay (offset to sit on top of OTB bars)
+        pickup_line_rev = (alt.Chart(fcast)
+                          .mark_line(color="#e67e22", strokeWidth=3, point=alt.MarkConfig(filled=True, size=60, color="#e67e22"))
+                          .encode(x="stay_date:T",
+                                  y=alt.Y("pickup_revenue:Q", title="Revenue (IDR)"),
+                                  tooltip=["stay_date:T",
+                                           alt.Tooltip("pickup_revenue:Q",format=",.0f",title="Pickup Revenue")]))
+
+        # Total forecast line
+        total_line_rev = (alt.Chart(fcast).mark_line(color="#3949ab",strokeDash=[4,2],strokeWidth=2)
+                         .encode(x="stay_date:T",
+                                 y=alt.Y("total_revenue:Q",axis=alt.Axis(format="~s")),
+                                 tooltip=["stay_date:T",
+                                          alt.Tooltip("total_revenue:Q",format=",.0f",title="Total Forecast")]))
+        st.altair_chart(bar_rev + total_line_rev + pickup_line_rev, use_container_width=True)
         # Table: one row per stay_date with otb_revenue & pickup_revenue as columns
         rev_tbl = rev_bar.copy()
         rev_tbl["stay_date"] = rev_tbl["stay_date"].dt.strftime("%Y-%m-%d")
@@ -766,8 +911,14 @@ with tab_fcast:
         with st.expander("📊 View nightly revenue table (OTB vs Pickup by date)"):
             st.dataframe(rev_tbl, use_container_width=True, height=300)
 
-        # ── Occupancy: OTB + Pickup stacked + capacity ceiling ────────────────
+        # ── Occupancy: OTB + Pickup with line overlay ────────────────
         st.markdown("**Occupancy %: OTB (confirmed) vs Pickup (model prediction)**")
+
+        # Add pickup visibility indicator
+        avg_pickup = fcast["pickup_occ_pct"].mean()
+        if avg_pickup < 1.0:
+            st.info(f"ℹ️ Average pickup is only {avg_pickup:.1f}%. This may be hard to see on the chart. The table below shows exact values.")
+
         occ_melt = fcast[["stay_date","otb_occ_pct","pickup_occ_pct"]].melt(
             "stay_date",var_name="Component",value_name="Occ %")
         bar_occ = (alt.Chart(occ_melt).mark_bar()
@@ -783,10 +934,29 @@ with tab_fcast:
                            tooltip=["stay_date:T",
                                     alt.Tooltip("Occ %:Q",format=".1f"),"Component:N"])
                    .properties(height=280))
+
+        # Pickup line with points for visibility
+        pickup_line_occ = (alt.Chart(fcast)
+                          .mark_line(color="#e67e22", strokeWidth=3,
+                                     point=alt.MarkConfig(filled=True, size=70, color="#e67e22", stroke="#fff", strokeWidth=1))
+                          .encode(x="stay_date:T",
+                                  y=alt.Y("pickup_occ_pct:Q", scale=alt.Scale(domain=[0,105]), title="Occupancy %"),
+                                  tooltip=["stay_date:T",
+                                           alt.Tooltip("pickup_occ_pct:Q",format=".1f",title="Pickup Occ %")]))
+
+        # Total occupancy line
+        total_line_occ = (alt.Chart(fcast)
+                         .mark_line(color="#3949ab",strokeDash=[4,2],strokeWidth=2)
+                         .encode(x="stay_date:T",
+                                 y=alt.Y("total_occ_pct:Q", scale=alt.Scale(domain=[0,105])),
+                                 tooltip=["stay_date:T",
+                                          alt.Tooltip("total_occ_pct:Q",format=".1f",title="Total Occ %")]))
+
+        # 100% capacity line
         cap_line2 = (alt.Chart(pd.DataFrame({"stay_date":fcast["stay_date"],"cap":[100]*len(fcast)}))
                      .mark_rule(color="#e94560",strokeDash=[4,2],strokeWidth=1)
                      .encode(x="stay_date:T",y="cap:Q"))
-        st.altair_chart(bar_occ + cap_line2, use_container_width=True)
+        st.altair_chart(bar_occ + pickup_line_occ + total_line_occ + cap_line2, use_container_width=True)
         # Table: one row per stay_date with OTB % & Pickup % as columns
         occ_tbl = fcast[["stay_date", "otb_occ_pct", "pickup_occ_pct"]].copy()
         occ_tbl["stay_date"] = occ_tbl["stay_date"].dt.strftime("%Y-%m-%d")
@@ -902,9 +1072,10 @@ with tab_fcast:
 
     # Download
     dl = fcast.copy(); dl["stay_date"] = dl["stay_date"].astype(str)
+    month_suffix = selected_month_name.replace(' ', '_')
     st.download_button("⬇️ Download OTB-Anchored Forecast CSV",
                         dl.to_csv(index=False).encode(),
-                        f"otb_forecast_{horizon}d.csv","text/csv")
+                        f"otb_forecast_{month_suffix}.csv","text/csv")
 
     # Insights
     st.markdown('<p class="sec">💡 Key Insights</p>', unsafe_allow_html=True)
@@ -951,6 +1122,9 @@ with tab_adr:
     try:
         import altair as alt
 
+        # Add top margin after KPI cards
+        st.markdown("<div style='margin-top: 1.5rem;'></div>", unsafe_allow_html=True)
+
         # OTB ADR vs Total Forecast ADR
         adr_df = fcast[["stay_date","otb_adr","total_adr"]].copy()
         adr_melt = adr_df.melt("stay_date",var_name="Series",value_name="ADR")
@@ -966,8 +1140,28 @@ with tab_adr:
               .properties(title="ADR: OTB Booked Rate vs Total Forecast",height=280))
         st.altair_chart(ac, use_container_width=True)
 
+        # Table: one row per stay_date with OTB ADR & Forecast ADR as columns
+        adr_tbl = fcast[["stay_date", "otb_adr", "total_adr"]].copy()
+        adr_tbl["stay_date"] = adr_tbl["stay_date"].dt.strftime("%Y-%m-%d")
+        adr_tbl = adr_tbl.rename(columns={
+            "stay_date": "Stay Date",
+            "otb_adr": "OTB ADR",
+            "total_adr": "Forecast ADR",
+        })
+        adr_tbl["OTB ADR"] = adr_tbl["OTB ADR"].apply(lambda x: f"{x:,.0f}")
+        adr_tbl["Forecast ADR"] = adr_tbl["Forecast ADR"].apply(lambda x: f"{x:,.0f}")
+        with st.expander("📊 View ADR table (OTB ADR vs Forecast ADR by date)"):
+            st.dataframe(adr_tbl, use_container_width=True, height=300)
+
         # Historical ADR + forecast
-        h_adr = daily.tail(90)[["stay_date","adr"]].copy(); h_adr["series"]="Historical"
+        # Show actuals for the full range that overlaps the chart: from (forecast start − 90d) to forecast end,
+        # so April–Sep and all other actuals in the forecast window appear (not just the last 90 rows).
+        fcast_min = fcast["stay_date"].min()
+        fcast_max = fcast["stay_date"].max()
+        range_start = fcast_min - timedelta(days=90)
+        hist_mask = (daily["stay_date"] >= range_start) & (daily["stay_date"] <= fcast_max)
+        h_adr = daily.loc[hist_mask, ["stay_date", "adr"]].copy()
+        h_adr["series"] = "Historical"
         f_adr = fcast[["stay_date","total_adr"]].rename(columns={"total_adr":"adr"})
         f_adr["series"] = "Forecast"
         adr_hist = pd.concat([h_adr,f_adr])
@@ -981,6 +1175,18 @@ with tab_adr:
                        tooltip=["stay_date:T","series:N",alt.Tooltip("adr:Q",format=",.0f")])
                .properties(title="ADR — Historical + Forecast",height=260))
         st.altair_chart(ahc, use_container_width=True)
+
+        # Table: one row per date with Historical ADR and Forecast ADR
+        all_dates_adr = pd.DataFrame({"stay_date": pd.date_range(start=range_start, end=fcast_max, freq="D")})
+        hist_adr_df = daily.loc[hist_mask, ["stay_date", "adr"]].rename(columns={"adr": "Historical ADR"})
+        fore_adr_df = fcast[["stay_date", "total_adr"]].rename(columns={"total_adr": "Forecast ADR"})
+        adr_hf_tbl = all_dates_adr.merge(hist_adr_df, on="stay_date", how="left").merge(fore_adr_df, on="stay_date", how="left")
+        adr_hf_tbl["stay_date"] = adr_hf_tbl["stay_date"].dt.strftime("%Y-%m-%d")
+        adr_hf_tbl = adr_hf_tbl.rename(columns={"stay_date": "Stay Date"})
+        for c in ["Historical ADR", "Forecast ADR"]:
+            adr_hf_tbl[c] = adr_hf_tbl[c].apply(lambda x: f"{x:,.0f}" if pd.notna(x) else "")
+        with st.expander("📊 View historical + forecast ADR table"):
+            st.dataframe(adr_hf_tbl, use_container_width=True, height=350)
 
         # Heatmap
         st.markdown("**ADR Heatmap — Month × Day of Week (Historical)**")
@@ -999,6 +1205,19 @@ with tab_adr:
 
     except ImportError:
         st.line_chart(fcast.set_index("stay_date")[["otb_adr","total_adr"]])
+
+        # Table: one row per stay_date with OTB ADR & Forecast ADR as columns
+        adr_tbl = fcast[["stay_date", "otb_adr", "total_adr"]].copy()
+        adr_tbl["stay_date"] = adr_tbl["stay_date"].dt.strftime("%Y-%m-%d")
+        adr_tbl = adr_tbl.rename(columns={
+            "stay_date": "Stay Date",
+            "otb_adr": "OTB ADR",
+            "total_adr": "Forecast ADR",
+        })
+        adr_tbl["OTB ADR"] = adr_tbl["OTB ADR"].apply(lambda x: f"{x:,.0f}")
+        adr_tbl["Forecast ADR"] = adr_tbl["Forecast ADR"].apply(lambda x: f"{x:,.0f}")
+        with st.expander("📊 View ADR table (OTB ADR vs Forecast ADR by date)"):
+            st.dataframe(adr_tbl, use_container_width=True, height=300)
 
     # Insights
     st.markdown('<p class="sec">💡 ADR Insights</p>', unsafe_allow_html=True)
@@ -1358,7 +1577,7 @@ with tab_fi:
 with tab_data:
     st.markdown('<p class="sec">📋 OTB Snapshot & Daily Master</p>', unsafe_allow_html=True)
 
-    st.markdown(f"**On-the-Book as of {as_of_date} (next {horizon} days)**")
+    st.markdown(f"**On-the-Book as of {as_of_date} (through {selected_month_name})**")
     otb_show = otb_df.copy()
     otb_show["stay_date"]   = otb_show["stay_date"].dt.strftime("%a %d %b")
     otb_show["occ_pct_otb"] = otb_show["occ_pct_otb"].apply(lambda x:f"{x:.1f}%")
@@ -1379,7 +1598,7 @@ with tab_data:
     dl2 = fcast.copy(); dl2["stay_date"] = dl2["stay_date"].astype(str)
     st.download_button("⬇️ Download OTB Forecast CSV",
                         dl2.to_csv(index=False).encode(),
-                        f"otb_forecast_{as_of_date}_{horizon}d.csv","text/csv")
+                        f"otb_forecast_{as_of_date}_{selected_month_name.replace(' ', '_')}.csv","text/csv")
 
 # ── Footer ──────────────────────────────────────────────────────────────────────
 st.markdown("---")
