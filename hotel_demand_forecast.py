@@ -255,48 +255,227 @@ def _add_time(df):
     return df
 
 
-def _add_lags(df, targets):
+def _add_lags(df, targets, max_lags=None):
+    """
+    Add lag and rolling features with optional cap on feature count.
+    If max_lags is set, only include the most important lags to reduce overfitting.
+    """
     df = df.copy()
+    # Core lag set - most predictive lags (reduced from original to fight overfitting)
+    core_lags = [1, 2, 3, 7, 14, 21, 28, 30, 60, 90, 365]
+    if max_lags:
+        core_lags = core_lags[:max_lags]
+
     for t in targets:
         if t not in df.columns: continue
-        # Extended lag features
-        for lag in [1,2,3,4,5,6,7,10,14,21,28,30,60,90,120,180,365]:
+        # Core lag features (most predictive)
+        for lag in core_lags:
             df[f"{t}_lag{lag}"] = df[t].shift(lag)
-        # Rolling statistics
-        for w in [3,5,7,14,21,30,60,90]:
-            df[f"{t}_roll{w}"]      = df[t].shift(1).rolling(w).mean()
-            df[f"{t}_roll{w}std"]   = df[t].shift(1).rolling(w).std()
-            df[f"{t}_roll{w}min"]   = df[t].shift(1).rolling(w).min()
-            df[f"{t}_roll{w}max"]   = df[t].shift(1).rolling(w).max()
-            df[f"{t}_roll{w}median"] = df[t].shift(1).rolling(w).median()
-        # Exponentially weighted moving averages (more weight to recent data)
-        for span in [3,7,14,30]:
+        # Essential rolling statistics (reduced set)
+        for w in [7, 14, 30, 60]:
+            df[f"{t}_roll{w}"] = df[t].shift(1).rolling(w).mean()
+            df[f"{t}_roll{w}std"] = df[t].shift(1).rolling(w).std()
+        # EWMA for recent trend emphasis
+        for span in [7, 14, 30]:
             df[f"{t}_ewma{span}"] = df[t].shift(1).ewm(span=span, adjust=False).mean()
-        # Differential features (rate of change)
-        for lag in [1,7,14,30]:
+        # Key differentials
+        for lag in [1, 7, 30]:
             df[f"{t}_diff{lag}"] = df[t].diff(lag)
             df[f"{t}_pct_chg{lag}"] = df[t].pct_change(lag).replace([np.inf, -np.inf], 0)
-        # Momentum: recent trend (short vs medium term)
+        # Momentum
         df[f"{t}_momentum"] = df[f"{t}_roll7"] - df[f"{t}_roll30"]
-        # Seasonal comparison: same day last week, last month, last year
-        df[f"{t}_yoy"] = df[t].diff(365)  # Year-over-year
-        df[f"{t}_mom"] = df[t].diff(30)   # Month-over-month
-        df[f"{t}_wow"] = df[t].diff(7)    # Week-over-week
+        # Seasonal comparison
+        df[f"{t}_yoy"] = df[t].diff(365)
+        df[f"{t}_mom"] = df[t].diff(30)
+        df[f"{t}_wow"] = df[t].diff(7)
     return df
+
+
+def _compute_r2(y_true, y_pred):
+    """Compute R2 score safely handling edge cases."""
+    ss_res = np.sum((y_true - y_pred) ** 2)
+    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+    if ss_tot == 0:
+        return 0.0
+    return 1 - (ss_res / ss_tot)
+
+
+def _walk_forward_cv(df, feat_cols, target, min_train_size=180, test_size=30, n_folds=5):
+    """
+    Perform expanding window walk-forward cross-validation.
+    Returns dict with fold metrics and aggregated statistics.
+    """
+    from sklearn.metrics import mean_absolute_error
+
+    n_samples = len(df)
+    if n_samples < min_train_size + test_size * n_folds:
+        # Not enough data - fall back to single split
+        return None
+
+    fold_metrics = []
+    fold_importances = []
+
+    for fold in range(n_folds):
+        train_end = min_train_size + fold * test_size
+        test_start = train_end
+        test_end = min(train_end + test_size, n_samples)
+
+        if test_end - test_start < 10:
+            break
+
+        X_train = df[feat_cols].iloc[:train_end]
+        y_train = df[target].iloc[:train_end]
+        X_test = df[feat_cols].iloc[test_start:test_end]
+        y_test = df[target].iloc[test_start:test_end]
+
+        # Skip if all same value
+        if y_train.nunique() <= 1 or y_test.nunique() <= 1:
+            continue
+
+        # Light model for CV (simpler to avoid fold overfitting)
+        import lightgbm as lgb
+        m = lgb.LGBMRegressor(
+            objective='regression',
+            n_estimators=500,
+            learning_rate=0.05,
+            max_depth=4,
+            num_leaves=16,
+            min_child_samples=20,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_alpha=0.1,
+            reg_lambda=0.2,
+            random_state=42 + fold,
+            verbose=-1,
+        )
+
+        m.fit(X_train, y_train)
+        preds = np.clip(m.predict(X_test), 0, None)
+        if "occ_pct" in target:
+            preds = np.minimum(preds, 100.0)
+
+        mae = mean_absolute_error(y_test, preds)
+        denom = np.where(y_test.values == 0, 1, y_test.values)
+        mape = float(np.mean(np.abs((y_test.values - preds) / denom)) * 100)
+        r2 = float(_compute_r2(y_test.values, preds))
+
+        fold_metrics.append({
+            'fold': fold + 1,
+            'train_end': train_end,
+            'test_start': test_start,
+            'test_end': test_end,
+            'r2': r2,
+            'mae': mae,
+            'mape': mape,
+            'preds': preds,
+            'actual': y_test.values,
+            'dates': df["stay_date"].iloc[test_start:test_end].values,
+        })
+        fold_importances.append(m.feature_importances_)
+
+    if not fold_metrics:
+        return None
+
+    # Aggregate fold metrics
+    r2s = [f['r2'] for f in fold_metrics]
+    maes = [f['mae'] for f in fold_metrics]
+    mapes = [f['mape'] for f in fold_metrics]
+
+    # Feature importance stability: variance across folds
+    importances_arr = np.array(fold_importances)
+    importance_mean = importances_arr.mean(axis=0)
+    importance_std = importances_arr.std(axis=0)
+    stability_score = np.where(importance_mean > 0,
+                               1 - (importance_std / (importance_mean + 1e-8)),
+                               0)
+
+    return {
+        'folds': fold_metrics,
+        'r2_mean': float(np.mean(r2s)),
+        'r2_std': float(np.std(r2s)),
+        'r2_median': float(np.median(r2s)),
+        'r2_min': float(np.min(r2s)),
+        'r2_max': float(np.max(r2s)),
+        'mae_mean': float(np.mean(maes)),
+        'mape_mean': float(np.mean(mapes)),
+        'importance_mean': importance_mean,
+        'importance_stability': stability_score,
+        'n_folds': len(fold_metrics),
+    }
+
+
+def _prune_features(df, feat_cols, target, cv_result, stability_threshold=0.5, importance_threshold=0.01):
+    """
+    Prune features based on importance stability across CV folds.
+    Returns list of features to keep.
+    """
+    if cv_result is None or 'importance_stability' not in cv_result:
+        return feat_cols
+
+    stability = cv_result['importance_stability']
+    importance = cv_result['importance_mean']
+
+    # Normalize importance
+    imp_sum = importance.sum()
+    if imp_sum > 0:
+        importance_norm = importance / imp_sum
+    else:
+        importance_norm = importance
+
+    # Keep features that are either stable OR important
+    keep_mask = (stability >= stability_threshold) | (importance_norm >= importance_threshold)
+
+    # Always keep time-based features (they're stable and essential)
+    time_features = ['dow', 'month', 'week', 'quarter', 'is_weekend', 'year', 'dom', 'doy',
+                     'month_sin', 'month_cos', 'dow_sin', 'dow_cos', 'week_sin', 'week_cos',
+                     'doy_sin', 'doy_cos', 'days_from_start', 'is_month_start', 'is_month_end']
+
+    kept_features = []
+    for i, feat in enumerate(feat_cols):
+        if i < len(keep_mask):
+            if keep_mask[i] or feat in time_features:
+                kept_features.append(feat)
+        elif feat in time_features:
+            kept_features.append(feat)
+
+    # Ensure we keep at least a minimum set of features
+    if len(kept_features) < 10:
+        # Fall back to top features by importance
+        top_indices = np.argsort(importance)[-20:]
+        for idx in top_indices:
+            if feat_cols[idx] not in kept_features:
+                kept_features.append(feat_cols[idx])
+
+    return kept_features
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TIME-SERIES MODEL TRAINING
 # ══════════════════════════════════════════════════════════════════════════════
 
-def train_ts_models(daily: pd.DataFrame):
+def train_ts_models(daily: pd.DataFrame, use_walk_forward=True, prune_features=True):
+    """
+    Train time-series models with walk-forward validation and feature pruning.
+
+    Args:
+        daily: Daily aggregated DataFrame
+        use_walk_forward: Whether to use walk-forward CV for robust evaluation
+        prune_features: Whether to prune unstable features based on CV stability
+
+    Returns:
+        models: Dict of trained models per target
+        metrics: Dict of metrics including robust CV stats
+        feat_cols: List of feature columns used
+        df: Processed DataFrame
+        cv_results: Dict of walk-forward CV results per target
+    """
     import lightgbm as lgb
     from sklearn.metrics import mean_absolute_error
-    from sklearn.preprocessing import StandardScaler
 
     all_ts_targets = TS_TARGETS + CHANNELS
     df = _add_time(daily)
-    df = _add_lags(df, all_ts_targets)
+    # Use reduced lag set to fight overfitting
+    df = _add_lags(df, all_ts_targets, max_lags=8)
     df = df.dropna().reset_index(drop=True)
 
     non_feat = ({"stay_date"} | set(all_ts_targets) |
@@ -304,62 +483,248 @@ def train_ts_models(daily: pd.DataFrame):
                 {f"pct_{ch}" for ch in CHANNELS})
     feat_cols = [c for c in df.columns if c not in non_feat]
 
-    split = len(df) - 90
-    models, metrics = {}, {}
+    # Final holdout split (always keep last 60 days for final evaluation)
+    split = len(df) - 60
+    models, metrics, cv_results = {}, {}, {}
 
     for target in all_ts_targets:
         if target not in df.columns: continue
-        X = df[feat_cols]; y = df[target]
-        Xtr, Xte = X.iloc[:split], X.iloc[split:]
-        ytr, yte  = y.iloc[:split], y.iloc[split:]
 
-        # Target-specific hyperparameters for better R2
+        X = df[feat_cols]
+        y = df[target]
+
+        # Walk-forward cross-validation for robust evaluation
+        cv_result = None
+        if use_walk_forward and len(df) >= 300:
+            cv_result = _walk_forward_cv(df, feat_cols, target, min_train_size=180, test_size=30, n_folds=5)
+            cv_results[target] = cv_result
+
+        # Feature pruning based on CV stability
+        if prune_features and cv_result is not None:
+            pruned_feats = _prune_features(df, feat_cols, target, cv_result,
+                                           stability_threshold=0.3, importance_threshold=0.005)
+            if len(pruned_feats) >= 10:
+                feat_cols_to_use = pruned_feats
+            else:
+                feat_cols_to_use = feat_cols
+        else:
+            feat_cols_to_use = feat_cols
+
+        Xtr, Xte = X.iloc[:split], X.iloc[split:]
+        ytr, yte = y.iloc[:split], y.iloc[split:]
+
+        # More conservative hyperparameters for better generalization
         if "occ_pct" in target:
-            # Occupancy needs stronger regularization due to bounded nature (0-100)
+            # Occupancy: stronger regularization for bounded target
             m = lgb.LGBMRegressor(
                 objective='regression',
-                n_estimators=3000, learning_rate=0.01, max_depth=5, num_leaves=31,
-                min_child_samples=20, subsample=0.7, colsample_bytree=0.7,
-                reg_alpha=0.5, reg_lambda=1.0, random_state=42, verbose=-1,
+                n_estimators=1500, learning_rate=0.02, max_depth=4, num_leaves=16,
+                min_child_samples=30, subsample=0.8, colsample_bytree=0.8,
+                reg_alpha=0.3, reg_lambda=0.5, random_state=42, verbose=-1,
                 feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=5,
             )
         elif target in CHANNELS:
-            # Channel models
+            # Channel models: moderate complexity
             m = lgb.LGBMRegressor(
                 objective='regression',
-                n_estimators=2000, learning_rate=0.015, max_depth=6, num_leaves=47,
-                min_child_samples=10, subsample=0.75, colsample_bytree=0.75,
+                n_estimators=1200, learning_rate=0.03, max_depth=4, num_leaves=24,
+                min_child_samples=20, subsample=0.8, colsample_bytree=0.8,
                 reg_alpha=0.2, reg_lambda=0.3, random_state=42, verbose=-1,
             )
         else:
-            # Revenue and ADR
+            # Revenue and ADR: balanced settings
             m = lgb.LGBMRegressor(
                 objective='regression',
-                n_estimators=2500, learning_rate=0.015, max_depth=6, num_leaves=47,
-                min_child_samples=10, subsample=0.8, colsample_bytree=0.8,
-                reg_alpha=0.1, reg_lambda=0.2, random_state=42, verbose=-1,
+                n_estimators=1500, learning_rate=0.03, max_depth=5, num_leaves=24,
+                min_child_samples=20, subsample=0.8, colsample_bytree=0.8,
+                reg_alpha=0.15, reg_lambda=0.25, random_state=42, verbose=-1,
             )
 
-        m.fit(Xtr, ytr, eval_set=[(Xte,yte)],
-              callbacks=[lgb.early_stopping(150, verbose=False)])
+        # Train with early stopping on validation set
+        m.fit(Xtr[feat_cols_to_use], ytr,
+              eval_set=[(Xte[feat_cols_to_use], yte)],
+              callbacks=[lgb.early_stopping(100, verbose=False)])
 
-        preds = np.clip(m.predict(Xte), 0, None)
-        if "occ_pct" in target: preds = np.minimum(preds, 100.0)
+        # Final evaluation on holdout
+        preds = np.clip(m.predict(Xte[feat_cols_to_use]), 0, None)
+        if "occ_pct" in target:
+            preds = np.minimum(preds, 100.0)
 
-        mae  = mean_absolute_error(yte, preds)
+        mae = mean_absolute_error(yte, preds)
         denom = np.where(yte.values == 0, 1, yte.values)
         mape = float(np.mean(np.abs((yte.values - preds) / denom)) * 100)
-        r2   = float(1 - np.sum((yte.values-preds)**2) /
-                     np.sum((yte.values - yte.mean())**2))
+        r2 = float(_compute_r2(yte.values, preds))
 
-        models[target]  = m
+        # Robust metrics from CV if available
+        if cv_result:
+            robust_r2 = cv_result['r2_median']
+            robust_r2_std = cv_result['r2_std']
+            expected_r2_range = (cv_result['r2_min'], cv_result['r2_max'])
+        else:
+            robust_r2 = r2
+            robust_r2_std = 0
+            expected_r2_range = (r2, r2)
+
+        models[target] = m
         metrics[target] = {
             "MAE": mae, "MAPE": mape, "R2": r2,
+            "Robust_R2": robust_r2,
+            "Robust_R2_Std": robust_r2_std,
+            "Expected_R2_Range": expected_r2_range,
             "test_preds": preds, "test_actual": yte.values,
             "test_dates": df["stay_date"].iloc[split:].values,
+            "feat_cols": feat_cols_to_use,
+            "n_features": len(feat_cols_to_use),
         }
 
-    return models, metrics, feat_cols, df
+    return models, metrics, feat_cols, df, cv_results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DRIFT DETECTION & MODEL PROMOTION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def compute_drift_metrics(old_data: pd.DataFrame, new_data: pd.DataFrame,
+                          numeric_cols=None, cat_cols=None) -> dict:
+    """
+    Compute drift metrics between old (training) and new (incoming) data.
+    Returns dict with drift scores and warnings.
+    """
+    if numeric_cols is None:
+        numeric_cols = ['Booked_Rate', 'Number_of_Nights', 'Number_of_Guests', 'lead_time']
+    if cat_cols is None:
+        cat_cols = ['Room_Type', 'Booking_Channel', 'Rate_Plan']
+
+    drift_report = {
+        'numeric': {},
+        'categorical': {},
+        'overall_drift_score': 0.0,
+        'drift_level': 'low',  # low, medium, high
+        'warnings': [],
+    }
+
+    # Numeric drift: standardized mean difference (Cohen's d)
+    for col in numeric_cols:
+        if col in old_data.columns and col in new_data.columns:
+            old_vals = old_data[col].dropna()
+            new_vals = new_data[col].dropna()
+            if len(old_vals) > 0 and len(new_vals) > 0:
+                old_mean, old_std = old_vals.mean(), old_vals.std()
+                new_mean, new_std = new_vals.mean(), new_vals.std()
+                pooled_std = np.sqrt((old_std**2 + new_std**2) / 2)
+                if pooled_std > 0:
+                    cohens_d = abs(new_mean - old_mean) / pooled_std
+                else:
+                    cohens_d = 0.0
+                drift_report['numeric'][col] = {
+                    'cohens_d': float(cohens_d),
+                    'old_mean': float(old_mean),
+                    'new_mean': float(new_mean),
+                    'drift': 'high' if cohens_d > 1.0 else 'medium' if cohens_d > 0.5 else 'low',
+                }
+
+    # Categorical drift: PSI-like metric using Jensen-Shannon distance
+    for col in cat_cols:
+        if col in old_data.columns and col in new_data.columns:
+            old_counts = old_data[col].value_counts(normalize=True)
+            new_counts = new_data[col].value_counts(normalize=True)
+            all_cats = set(old_counts.index) | set(new_counts.index)
+            # Create aligned distributions
+            old_dist = np.array([old_counts.get(c, 0) for c in all_cats])
+            new_dist = np.array([new_counts.get(c, 0) for c in all_cats])
+            # Add small epsilon to avoid log(0)
+            old_dist = old_dist + 1e-10
+            new_dist = new_dist + 1e-10
+            # Jensen-Shannon distance
+            m = 0.5 * (old_dist + new_dist)
+            js_div = 0.5 * (np.sum(old_dist * np.log(old_dist / m)) +
+                           np.sum(new_dist * np.log(new_dist / m)))
+            js_dist = np.sqrt(js_div)
+            drift_report['categorical'][col] = {
+                'js_distance': float(js_dist),
+                'drift': 'high' if js_dist > 0.3 else 'medium' if js_dist > 0.15 else 'low',
+            }
+
+    # Overall drift score (0-1 scale)
+    num_scores = [d.get('cohens_d', 0) / 2 for d in drift_report['numeric'].values()]
+    cat_scores = [d.get('js_distance', 0) for d in drift_report['categorical'].values()]
+    all_scores = num_scores + cat_scores
+
+    if all_scores:
+        drift_report['overall_drift_score'] = float(np.mean(all_scores))
+        max_score = max(all_scores)
+        if max_score > 0.5 or drift_report['overall_drift_score'] > 0.3:
+            drift_report['drift_level'] = 'high'
+        elif max_score > 0.25 or drift_report['overall_drift_score'] > 0.15:
+            drift_report['drift_level'] = 'medium'
+        else:
+            drift_report['drift_level'] = 'low'
+
+    # Generate warnings
+    high_drift_num = [c for c, d in drift_report['numeric'].items() if d.get('drift') == 'high']
+    high_drift_cat = [c for c, d in drift_report['categorical'].items() if d.get('drift') == 'high']
+    if high_drift_num:
+        drift_report['warnings'].append(f"High numeric drift in: {', '.join(high_drift_num)}")
+    if high_drift_cat:
+        drift_report['warnings'].append(f"High categorical drift in: {', '.join(high_drift_cat)}")
+    if drift_report['drift_level'] == 'high':
+        drift_report['warnings'].append("Significant data drift detected. Model retraining strongly recommended.")
+
+    return drift_report
+
+
+def should_promote_new_model(old_metrics: dict, new_metrics: dict,
+                             r2_tolerance=0.02, mape_tolerance=2.0) -> tuple:
+    """
+    Determine if new model should replace old model based on robust metrics.
+
+    Returns: (should_promote: bool, reasons: list)
+    """
+    reasons = []
+
+    # Compare robust R2 (median from walk-forward CV)
+    old_r2 = old_metrics.get('Robust_R2', old_metrics.get('R2', 0))
+    new_r2 = new_metrics.get('Robust_R2', new_metrics.get('R2', 0))
+    old_r2_std = old_metrics.get('Robust_R2_Std', 0)
+    new_r2_std = new_metrics.get('Robust_R2_Std', 0)
+
+    old_mape = old_metrics.get('MAPE', 100)
+    new_mape = new_metrics.get('MAPE', 100)
+
+    # Promotion criteria
+    promote = True
+
+    # R2 should not drop significantly
+    if new_r2 < old_r2 - r2_tolerance:
+        reasons.append(f"Robust R² dropped significantly ({new_r2:.3f} vs {old_r2:.3f})")
+        promote = False
+
+    # R2 should be stable (low variance across folds)
+    if new_r2_std > 0.15:
+        reasons.append(f"High R² variance across validation folds ({new_r2_std:.3f})")
+        if new_r2 < old_r2:
+            promote = False
+
+    # MAPE should improve or stay similar
+    if new_mape > old_mape + mape_tolerance:
+        reasons.append(f"MAPE increased ({new_mape:.1f}% vs {old_mape:.1f}%)")
+        if new_r2 < old_r2:
+            promote = False
+
+    # Minimum quality bar
+    if new_r2 < 0.3:
+        reasons.append(f"Robust R² below minimum threshold ({new_r2:.3f})")
+        promote = False
+
+    if promote:
+        if new_r2 > old_r2 + 0.01:
+            reasons.append(f"Improved robust R² ({new_r2:.3f} vs {old_r2:.3f})")
+        elif new_mape < old_mape - 1:
+            reasons.append(f"Improved MAPE ({new_mape:.1f}% vs {old_mape:.1f}%)")
+        else:
+            reasons.append("Performance maintained within tolerance")
+
+    return promote, reasons
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -631,7 +996,9 @@ def forecast_otb_anchored(ts_models, feat_cols, daily, otb_df, horizon=30):
 if "current_user" not in st.session_state:
     st.session_state.current_user = None
 for k in ("ts_models","ts_metrics","ts_feat_cols","ts_df","daily",
-          "m_cancel","cancel_metrics","m_los","los_metrics","raw","expanded"):
+          "m_cancel","cancel_metrics","m_los","los_metrics","raw","expanded",
+          "cv_results","drift_report","pending_models","pending_metrics",
+          "training_baseline_data","model_promotion_status"):
     if k not in st.session_state:
         st.session_state[k] = None
 
@@ -748,6 +1115,34 @@ with st.sidebar:
         CAPACITY["total"]    = CAPACITY["Standard"] + CAPACITY["Deluxe"] + CAPACITY["Suite"]
 
     st.markdown("---")
+
+    # Drift detection warning for new data
+    if uploaded is not None and st.session_state.raw is not None:
+        try:
+            df_peek = pd.read_csv(uploaded)
+            df_peek["Booking_Date"] = pd.to_datetime(df_peek["Booking_Date"])
+            drift = compute_drift_metrics(st.session_state.raw, df_peek)
+            st.session_state.drift_report = drift
+            uploaded.seek(0)
+
+            if drift['drift_level'] == 'high':
+                st.warning("⚠️ **High data drift detected!** Model retraining strongly recommended.")
+            elif drift['drift_level'] == 'medium':
+                st.info("ℹ️ Moderate data drift. Consider model retraining.")
+        except Exception:
+            pass
+
+    # Model promotion status display
+    if st.session_state.model_promotion_status:
+        status = st.session_state.model_promotion_status
+        if status.get('promoted'):
+            st.success(f"✅ {status.get('message', 'Models promoted')}")
+        else:
+            st.error(f"❌ {status.get('message', 'Models rejected')}")
+            if status.get('reasons'):
+                for r in status['reasons']:
+                    st.caption(f"• {r}")
+
     if st.button("🚀 Train All Models", type="primary", use_container_width=True):
         if uploaded is None:
             st.error("Upload a CSV first.")
@@ -756,39 +1151,81 @@ with st.sidebar:
             raw_proc, expanded = load_and_expand(uploaded)
             prog.progress(25, "Building daily aggregates…")
             daily = build_daily(expanded)
-            prog.progress(45, "Training time-series models…")
-            ts_models, ts_metrics, feat_cols, ts_df = train_ts_models(daily)
+            prog.progress(45, "Running walk-forward validation…")
+            ts_models, ts_metrics, feat_cols, ts_df, cv_results = train_ts_models(daily)
             prog.progress(80, "Training booking-level models…")
             m_c, cancel_met, m_l, los_met = train_booking_models(raw_proc)
-            prog.progress(100, "Done!")
+            prog.progress(100, "Evaluating model quality…")
 
-            st.session_state.ts_models      = ts_models
-            st.session_state.ts_metrics     = ts_metrics
-            st.session_state.ts_feat_cols   = feat_cols
-            st.session_state.ts_df          = ts_df
-            st.session_state.daily          = daily
-            st.session_state.m_cancel       = m_c
-            st.session_state.cancel_metrics = cancel_met
-            st.session_state.m_los          = m_l
-            st.session_state.los_metrics    = los_met
-            st.session_state.raw            = raw_proc
-            st.session_state.expanded       = expanded
-            if st.session_state.current_user:
-                save_session(st.session_state.current_user, dict(st.session_state))
-            prog.empty()
-            st.success("✅ All 12 models trained!")
+            # Model promotion decision
+            old_metrics = st.session_state.ts_metrics
+            promotion_reasons = []
+            should_promote = True
+
+            if old_metrics is not None:
+                # Compare each target's robust R2
+                all_promotable = True
+                for t in TS_TARGETS:
+                    if t in old_metrics and t in ts_metrics:
+                        promote, reasons = should_promote_new_model(old_metrics[t], ts_metrics[t])
+                        if not promote:
+                            all_promotable = False
+                            promotion_reasons.extend([f"{LABEL_MAP.get(t, t)}: {r}" for r in reasons])
+
+                should_promote = all_promotable
+
+            # Update session state with promotion decision
+            if should_promote:
+                st.session_state.ts_models = ts_models
+                st.session_state.ts_metrics = ts_metrics
+                st.session_state.ts_feat_cols = feat_cols
+                st.session_state.ts_df = ts_df
+                st.session_state.cv_results = cv_results
+                st.session_state.daily = daily
+                st.session_state.m_cancel = m_c
+                st.session_state.cancel_metrics = cancel_met
+                st.session_state.m_los = m_l
+                st.session_state.los_metrics = los_met
+                st.session_state.raw = raw_proc
+                st.session_state.expanded = expanded
+                st.session_state.training_baseline_data = raw_proc.copy()
+                st.session_state.model_promotion_status = {
+                    'promoted': True,
+                    'message': 'Models promoted to production',
+                    'reasons': promotion_reasons if promotion_reasons else ['Performance improved or maintained']
+                }
+                if st.session_state.current_user:
+                    save_session(st.session_state.current_user, dict(st.session_state))
+                prog.empty()
+                st.success("✅ Models trained and promoted!")
+            else:
+                # Store as pending, don't replace current models
+                st.session_state.pending_models = ts_models
+                st.session_state.pending_metrics = ts_metrics
+                st.session_state.model_promotion_status = {
+                    'promoted': False,
+                    'message': 'New models rejected - quality check failed',
+                    'reasons': promotion_reasons
+                }
+                st.session_state.cv_results = cv_results
+                prog.empty()
+                st.error("❌ New models failed quality check. Previous models retained.")
 
     if st.session_state.ts_models:
-        st.markdown("### 📊 Model Quality")
+        st.markdown("### 📊 Model Quality (Robust OOS)")
         for t in TS_TARGETS:
             if t in st.session_state.ts_metrics:
                 m = st.session_state.ts_metrics[t]
-                st.caption(f"**{LABEL_MAP.get(t,t)}** R²={m['R2']:.3f} MAPE={m['MAPE']:.1f}%")
+                robust_r2 = m.get('Robust_R2', m['R2'])
+                r2_range = m.get('Expected_R2_Range', (robust_r2, robust_r2))
+                st.caption(f"**{LABEL_MAP.get(t,t)}** "
+                          f"R²={robust_r2:.3f} (range: {r2_range[0]:.2f}-{r2_range[1]:.2f}) "
+                          f"MAPE={m['MAPE']:.1f}%")
         cm = st.session_state.cancel_metrics
         lm = st.session_state.los_metrics
         if cm: st.caption(f"**Cancellation** AUC={cm['AUC']:.3f}")
         if lm: st.caption(f"**LOS** MAE={lm['MAE']:.2f} nts Acc={lm['Accuracy']:.3f}")
-    st.caption("12 LightGBM models • OTB-anchored • Stay-date expansion")
+        st.caption("12 LightGBM • Walk-forward CV • Feature pruning • Drift-aware")
 
 # ── Guard ───────────────────────────────────────────────────────────────────────
 if st.session_state.ts_models is None:
@@ -1534,10 +1971,13 @@ with tab_channel:
 # TAB 6 — DIAGNOSTICS
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_diag:
-    st.markdown('<p class="sec">📊 Model Diagnostics</p>', unsafe_allow_html=True)
+    st.markdown('<p class="sec">📊 Model Diagnostics (Robust OOS)</p>', unsafe_allow_html=True)
     diag_t = st.selectbox("Select model",list(ts_metrics.keys()),
                            format_func=lambda x:LABEL_MAP.get(x,x))
     dm = ts_metrics[diag_t]
+    cv = st.session_state.cv_results.get(diag_t) if st.session_state.cv_results else None
+
+    # Robust metrics display with fold information
     diag_df = pd.DataFrame({
         "date": pd.to_datetime(dm["test_dates"]),
         "Actual": dm["test_actual"],
@@ -1546,11 +1986,67 @@ with tab_diag:
     diag_df["residual"] = diag_df["Actual"] - diag_df["Predicted"]
     diag_df["abs_pct"]  = (np.abs(diag_df["residual"]) /
                             np.where(diag_df["Actual"]==0,1,diag_df["Actual"]))*100
+
+    # Main metrics row
     d1,d2,d3,d4 = st.columns(4)
     with d1: st.markdown(kpi(f"{dm['MAE']:,.1f}","MAE"), unsafe_allow_html=True)
     with d2: st.markdown(kpi(f"{dm['MAPE']:.2f}%","MAPE","g"), unsafe_allow_html=True)
-    with d3: st.markdown(kpi(f"{dm['R2']:.4f}","R²","g"), unsafe_allow_html=True)
+    with d3:
+        robust_r2 = dm.get('Robust_R2', dm['R2'])
+        st.markdown(kpi(f"{robust_r2:.4f}","Robust R²","g"), unsafe_allow_html=True)
     with d4: st.markdown(kpi(f"{diag_df['abs_pct'].median():.1f}%","Median Abs Err%"), unsafe_allow_html=True)
+
+    # Expected R2 range from walk-forward CV
+    r2_range = dm.get('Expected_R2_Range', (robust_r2, robust_r2))
+    r2_std = dm.get('Robust_R2_Std', 0)
+
+    st.markdown(f"""
+    <div style="background:#f8f9ff;border-left:3px solid #0f3460;border-radius:8px;padding:.85rem 1rem;margin:.5rem 0;">
+    <b>Expected R² Range:</b> {r2_range[0]:.3f} – {r2_range[1]:.3f} &nbsp;|&nbsp;
+    <b>Cross-fold Std:</b> {r2_std:.3f} &nbsp;|&nbsp;
+    <b>Features Used:</b> {dm.get('n_features', 'N/A')}
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Walk-forward CV fold details
+    if cv and 'folds' in cv:
+        st.markdown('<p class="sec">📈 Walk-Forward Validation Folds</p>', unsafe_allow_html=True)
+        fold_data = []
+        for fold in cv['folds']:
+            fold_data.append({
+                'Fold': fold['fold'],
+                'Test Period': f"{pd.Timestamp(fold['dates'][0]).strftime('%Y-%m-%d')} to {pd.Timestamp(fold['dates'][-1]).strftime('%Y-%m-%d')}",
+                'R²': f"{fold['r2']:.3f}",
+                'MAE': f"{fold['mae']:.1f}",
+                'MAPE': f"{fold['mape']:.1f}%",
+            })
+        fold_df = pd.DataFrame(fold_data)
+        st.dataframe(fold_df, use_container_width=True, hide_index=True)
+
+        # Fold R2 distribution chart
+        try:
+            import altair as alt
+            fold_chart_df = pd.DataFrame({
+                'Fold': [f"Fold {f['fold']}" for f in cv['folds']],
+                'R2': [f['r2'] for f in cv['folds']],
+                'MAPE': [f['mape'] for f in cv['folds']],
+            })
+            fc1, fc2 = st.columns(2)
+            with fc1:
+                st.altair_chart(alt.Chart(fold_chart_df).mark_bar(color="#0f3460")
+                    .encode(x=alt.X("Fold:N"), y=alt.Y("R2:Q", scale=alt.Scale(domain=[0, 1])),
+                            tooltip=["Fold:N", alt.Tooltip("R2:Q", format=".3f")])
+                    .properties(height=220, title="R² by Fold"), use_container_width=True)
+            with fc2:
+                st.altair_chart(alt.Chart(fold_chart_df).mark_bar(color="#e94560")
+                    .encode(x=alt.X("Fold:N"), y=alt.Y("MAPE:Q"),
+                            tooltip=["Fold:N", alt.Tooltip("MAPE:Q", format=".1f")])
+                    .properties(height=220, title="MAPE by Fold"), use_container_width=True)
+        except ImportError:
+            pass
+
+    # Actual vs Predicted and Residuals
+    st.markdown('<p class="sec">📉 Prediction Quality</p>', unsafe_allow_html=True)
     try:
         import altair as alt
         melt = diag_df[["date","Actual","Predicted"]].melt("date")
@@ -1573,6 +2069,22 @@ with tab_diag:
                 .properties(height=220,title="Abs % Error"),use_container_width=True)
     except ImportError:
         st.line_chart(diag_df.set_index("date")[["Actual","Predicted"]])
+
+    # Drift report if available
+    if st.session_state.drift_report:
+        st.markdown('<p class="sec">🔄 Data Drift Analysis</p>', unsafe_allow_html=True)
+        drift = st.session_state.drift_report
+        drift_level = drift.get('drift_level', 'low')
+        drift_color = {'low': '#27ae60', 'medium': '#e67e22', 'high': '#e74c3c'}
+        st.markdown(f"""
+        <div style="background:#fff;border-left:4px solid {drift_color.get(drift_level, '#27ae60')};border-radius:8px;padding:.85rem 1rem;margin:.5rem 0;">
+        <b>Overall Drift Level:</b> <span style="color:{drift_color.get(drift_level)};font-weight:bold;text-transform:uppercase;">{drift_level}</span> &nbsp;|&nbsp;
+        <b>Drift Score:</b> {drift.get('overall_drift_score', 0):.3f}
+        </div>
+        """, unsafe_allow_html=True)
+        if drift.get('warnings'):
+            for warning in drift['warnings']:
+                st.warning(warning)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
