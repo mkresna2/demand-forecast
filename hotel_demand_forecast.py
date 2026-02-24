@@ -26,7 +26,7 @@ import numpy as np
 import warnings
 from datetime import timedelta
 
-from user_session import init_db, load_session, save_session, list_users
+from user_session import init_db, load_session, save_session, list_users, delete_session
 
 warnings.filterwarnings("ignore")
 
@@ -808,7 +808,7 @@ def train_booking_models(raw: pd.DataFrame):
 # OTB-ANCHORED FORECAST ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
 
-def forecast_otb_anchored(ts_models, feat_cols, daily, otb_df, horizon=30):
+def forecast_otb_anchored(ts_models, feat_cols, ts_metrics, daily, otb_df, horizon=30):
     """
     OTB-Anchored Forecast:
     1. For each future date, check OTB (already confirmed)
@@ -818,6 +818,13 @@ def forecast_otb_anchored(ts_models, feat_cols, daily, otb_df, horizon=30):
 
     Returns df with columns: stay_date, otb_*, model_*, pickup_*, total_*
     """
+    # Build per-model feature column map (handles feature pruning per target)
+    per_model_feat_cols = {}
+    for t in ts_models.keys():
+        if t in ts_metrics and "feat_cols" in ts_metrics[t]:
+            per_model_feat_cols[t] = ts_metrics[t]["feat_cols"]
+        else:
+            per_model_feat_cols[t] = feat_cols
     all_ts_targets = TS_TARGETS + CHANNELS
     df       = _add_time(daily).sort_values("stay_date").reset_index(drop=True)
 
@@ -894,18 +901,23 @@ def forecast_otb_anchored(ts_models, feat_cols, daily, otb_df, horizon=30):
         history = _add_lags(history, all_ts_targets)
         # Re-find the index after _add_lags returns a new DataFrame
         idx = history[history["stay_date"] == next_date].index[0]
-        row_f   = history.loc[[idx], feat_cols]
+
+        # Build full feature row once - all models need consistent source data
+        row_full = history.loc[[idx], feat_cols]
 
         # Fill any remaining NaNs with recent means instead of zeros
-        for col in row_f.columns:
-            if row_f[col].isna().any():
+        for col in row_full.columns:
+            if row_full[col].isna().any():
                 if col in recent_means:
-                    row_f[col] = row_f[col].fillna(recent_means[col])
+                    row_full[col] = row_full[col].fillna(recent_means[col])
                 else:
-                    row_f[col] = row_f[col].fillna(0)
+                    row_full[col] = row_full[col].fillna(0)
 
         model_pred = {}
         for t, m in ts_models.items():
+            # Use per-model feature columns (handles feature pruning)
+            model_feats = per_model_feat_cols.get(t, feat_cols)
+            row_f = row_full[model_feats]
             v = float(np.clip(m.predict(row_f)[0], 0, None))
             if "occ_pct" in t: v = min(v, 100.0)
             model_pred[t] = v
@@ -1044,6 +1056,20 @@ with st.sidebar:
                       "m_cancel","cancel_metrics","m_los","los_metrics","raw","expanded"):
                 st.session_state[k] = None
             st.rerun()
+    if st.button("🗑️ Clear Session Data", use_container_width=True, key="clear_session_btn"):
+        current_user = st.session_state.current_user
+        if current_user:
+            deleted = delete_session(current_user)
+            if deleted:
+                st.info(f"Deleted saved data for user: {current_user}")
+        st.session_state.current_user = None
+        for k in ("ts_models","ts_metrics","ts_feat_cols","ts_df","daily",
+                  "m_cancel","cancel_metrics","m_los","los_metrics","raw","expanded",
+                  "cv_results","drift_report","pending_models","pending_metrics",
+                  "training_baseline_data","model_promotion_status"):
+            st.session_state[k] = None
+        st.success("Session cleared. Upload data and train to start fresh.")
+        st.rerun()
     st.markdown("---")
     st.markdown("## ⚙️ Controls")
     uploaded = st.file_uploader("📂 Upload Bookings CSV", type=["csv"])
@@ -1256,7 +1282,7 @@ expanded       = st.session_state.expanded
 # ══════════════════════════════════════════════════════════════════════════════
 with st.spinner("Computing OTB and generating forecast…"):
     otb_df  = get_otb(raw, as_of_ts, horizon)
-    fcast   = forecast_otb_anchored(ts_models, feat_cols, daily, otb_df, horizon)
+    fcast   = forecast_otb_anchored(ts_models, feat_cols, ts_metrics, daily, otb_df, horizon)
 
 tomorrow_str = (as_of_ts + timedelta(days=1)).strftime("%d %b %Y")
 end_str      = (as_of_ts + timedelta(days=horizon)).strftime("%d %b %Y")
@@ -1335,7 +1361,9 @@ with tab_fcast:
     # ── Month Filter for Results View ───────────────────────────────────────────
     months_in_forecast = sorted(fcast["stay_date"].dt.to_period("M").unique())
     month_labels = ["All Months"] + [str(m) for m in months_in_forecast]
-    selected_view_month = st.selectbox("📅 Filter results by month", month_labels, index=0, key="month_filter_results")
+    # Default to first month (current month) instead of "All Months"
+    default_month_index = 1 if len(month_labels) > 1 else 0
+    selected_view_month = st.selectbox("📅 Filter results by month", month_labels, index=default_month_index, key="month_filter_results")
 
     if selected_view_month != "All Months":
         selected_period = pd.Period(selected_view_month)
@@ -2109,7 +2137,9 @@ with tab_fi:
     if fi_src == "Time-Series":
         fi_t = st.selectbox("Model",list(ts_models.keys()),
                              format_func=lambda x:LABEL_MAP.get(x,x))
-        fi_df = pd.DataFrame({"Feature":feat_cols,
+        # Use per-model feature columns (handles feature pruning)
+        model_feat_cols = ts_metrics.get(fi_t, {}).get("feat_cols", feat_cols)
+        fi_df = pd.DataFrame({"Feature":model_feat_cols,
                                "Importance":ts_models[fi_t].feature_importances_}).sort_values(
             "Importance",ascending=False).head(25)
     else:

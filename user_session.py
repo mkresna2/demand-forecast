@@ -185,3 +185,14 @@ def list_users() -> list[str]:
             "SELECT username FROM user_sessions ORDER BY updated_at DESC"
         ).fetchall()
     return [r[0] for r in rows]
+
+
+def delete_session(username: str) -> bool:
+    """Delete saved session for the given username. Returns True if deleted, False if not found."""
+    init_db()
+    with _get_conn() as conn:
+        cursor = conn.execute(
+            "DELETE FROM user_sessions WHERE username = ?", (username,)
+        )
+        conn.commit()
+        return cursor.rowcount > 0
