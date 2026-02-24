@@ -1330,12 +1330,23 @@ with tab_fcast:
     st.markdown(f'<p class="sec">🔮 OTB-Anchored Demand Forecast — {tomorrow_str} to {end_str}</p>',
                 unsafe_allow_html=True)
 
+    # ── Month Filter for Results View ───────────────────────────────────────────
+    months_in_forecast = sorted(fcast["stay_date"].dt.to_period("M").unique())
+    month_labels = ["All Months"] + [str(m) for m in months_in_forecast]
+    selected_view_month = st.selectbox("📅 Filter results by month", month_labels, index=0, key="month_filter_results")
+
+    if selected_view_month != "All Months":
+        selected_period = pd.Period(selected_view_month)
+        fcast_filtered = fcast[fcast["stay_date"].dt.to_period("M") == selected_period].copy()
+    else:
+        fcast_filtered = fcast.copy()
+
     try:
         import altair as alt
 
         # ── Revenue: OTB + Pickup stacked bar + pickup line overlay ────────────────
         st.markdown("**Nightly Revenue: OTB (confirmed) vs Pickup (model prediction)**")
-        rev_bar = fcast[["stay_date","otb_revenue","pickup_revenue"]].copy()
+        rev_bar = fcast_filtered[["stay_date","otb_revenue","pickup_revenue"]].copy()
         rev_melt = rev_bar.melt("stay_date",var_name="Component",value_name="Revenue")
 
         bar_rev = (alt.Chart(rev_melt).mark_bar()
@@ -1353,7 +1364,7 @@ with tab_fcast:
                    .properties(height=300))
 
         # Pickup line overlay (offset to sit on top of OTB bars)
-        pickup_line_rev = (alt.Chart(fcast)
+        pickup_line_rev = (alt.Chart(fcast_filtered)
                           .mark_line(color="#e67e22", strokeWidth=3, point=alt.MarkConfig(filled=True, size=60, color="#e67e22"))
                           .encode(x="stay_date:T",
                                   y=alt.Y("pickup_revenue:Q", title="Revenue (IDR)"),
@@ -1361,7 +1372,7 @@ with tab_fcast:
                                            alt.Tooltip("pickup_revenue:Q",format=",.0f",title="Pickup Revenue")]))
 
         # Total forecast line
-        total_line_rev = (alt.Chart(fcast).mark_line(color="#3949ab",strokeDash=[4,2],strokeWidth=2)
+        total_line_rev = (alt.Chart(fcast_filtered).mark_line(color="#3949ab",strokeDash=[4,2],strokeWidth=2)
                          .encode(x="stay_date:T",
                                  y=alt.Y("total_revenue:Q",axis=alt.Axis(format="~s")),
                                  tooltip=["stay_date:T",
@@ -1384,11 +1395,11 @@ with tab_fcast:
         st.markdown("**Occupancy %: OTB (confirmed) vs Pickup (model prediction)**")
 
         # Add pickup visibility indicator
-        avg_pickup = fcast["pickup_occ_pct"].mean()
+        avg_pickup = fcast_filtered["pickup_occ_pct"].mean()
         if avg_pickup < 1.0:
             st.info(f"ℹ️ Average pickup is only {avg_pickup:.1f}%. This may be hard to see on the chart. The table below shows exact values.")
 
-        occ_melt = fcast[["stay_date","otb_occ_pct","pickup_occ_pct"]].melt(
+        occ_melt = fcast_filtered[["stay_date","otb_occ_pct","pickup_occ_pct"]].melt(
             "stay_date",var_name="Component",value_name="Occ %")
         bar_occ = (alt.Chart(occ_melt).mark_bar()
                    .encode(x=alt.X("stay_date:T"),
@@ -1405,7 +1416,7 @@ with tab_fcast:
                    .properties(height=280))
 
         # Pickup line with points for visibility
-        pickup_line_occ = (alt.Chart(fcast)
+        pickup_line_occ = (alt.Chart(fcast_filtered)
                           .mark_line(color="#e67e22", strokeWidth=3,
                                      point=alt.MarkConfig(filled=True, size=70, color="#e67e22", stroke="#fff", strokeWidth=1))
                           .encode(x="stay_date:T",
@@ -1414,7 +1425,7 @@ with tab_fcast:
                                            alt.Tooltip("pickup_occ_pct:Q",format=".1f",title="Pickup Occ %")]))
 
         # Total occupancy line
-        total_line_occ = (alt.Chart(fcast)
+        total_line_occ = (alt.Chart(fcast_filtered)
                          .mark_line(color="#3949ab",strokeDash=[4,2],strokeWidth=2)
                          .encode(x="stay_date:T",
                                  y=alt.Y("total_occ_pct:Q", scale=alt.Scale(domain=[0,105])),
@@ -1422,12 +1433,12 @@ with tab_fcast:
                                           alt.Tooltip("total_occ_pct:Q",format=".1f",title="Total Occ %")]))
 
         # 100% capacity line
-        cap_line2 = (alt.Chart(pd.DataFrame({"stay_date":fcast["stay_date"],"cap":[100]*len(fcast)}))
+        cap_line2 = (alt.Chart(pd.DataFrame({"stay_date":fcast_filtered["stay_date"],"cap":[100]*len(fcast_filtered)}))
                      .mark_rule(color="#e94560",strokeDash=[4,2],strokeWidth=1)
                      .encode(x="stay_date:T",y="cap:Q"))
         st.altair_chart(bar_occ + pickup_line_occ + total_line_occ + cap_line2, use_container_width=True)
         # Table: one row per stay_date with OTB % & Pickup % as columns
-        occ_tbl = fcast[["stay_date", "otb_occ_pct", "pickup_occ_pct"]].copy()
+        occ_tbl = fcast_filtered[["stay_date", "otb_occ_pct", "pickup_occ_pct"]].copy()
         occ_tbl["stay_date"] = occ_tbl["stay_date"].dt.strftime("%Y-%m-%d")
         occ_tbl = occ_tbl.rename(columns={
             "stay_date": "Stay Date",
@@ -1443,16 +1454,16 @@ with tab_fcast:
         st.markdown("**Historical Occupancy (last 90 days) + Total Forecast**")
         # Show actuals for the full range that overlaps the chart: from (forecast start − 90d) to forecast end,
         # so April–Sep and all other actuals in the forecast window appear (not just the last 90 rows).
-        fcast_min = fcast["stay_date"].min()
-        fcast_max = fcast["stay_date"].max()
+        fcast_min = fcast_filtered["stay_date"].min()
+        fcast_max = fcast_filtered["stay_date"].max()
         range_start = fcast_min - timedelta(days=90)
         hist_mask = (daily["stay_date"] >= range_start) & (daily["stay_date"] <= fcast_max)
         hist_occ = daily.loc[hist_mask, ["stay_date", "occ_pct_total"]].copy()
         hist_occ["series"] = "Historical (Actual)"
-        fore_occ = fcast[["stay_date","total_occ_pct"]].rename(
+        fore_occ = fcast_filtered[["stay_date","total_occ_pct"]].rename(
             columns={"total_occ_pct":"occ_pct_total"}).copy()
         fore_occ["series"] = "Total Forecast"
-        otb_line = fcast[["stay_date","otb_occ_pct"]].rename(
+        otb_line = fcast_filtered[["stay_date","otb_occ_pct"]].rename(
             columns={"otb_occ_pct":"occ_pct_total"}).copy()
         otb_line["series"] = "OTB Only"
         combined = pd.concat([hist_occ, fore_occ, otb_line])
@@ -1473,7 +1484,7 @@ with tab_fcast:
         # Table: one row per date with Historical (Actual), OTB Only, Total Forecast
         all_dates = pd.DataFrame({"stay_date": pd.date_range(start=range_start, end=fcast_max, freq="D")})
         hist_df = daily.loc[hist_mask, ["stay_date", "occ_pct_total"]].rename(columns={"occ_pct_total": "Historical (Actual)"})
-        fore_df = fcast[["stay_date", "otb_occ_pct", "total_occ_pct"]].rename(
+        fore_df = fcast_filtered[["stay_date", "otb_occ_pct", "total_occ_pct"]].rename(
             columns={"otb_occ_pct": "OTB Only", "total_occ_pct": "Total Forecast"})
         hf_tbl = all_dates.merge(hist_df, on="stay_date", how="left").merge(fore_df, on="stay_date", how="left")
         hf_tbl["stay_date"] = hf_tbl["stay_date"].dt.strftime("%Y-%m-%d")
@@ -1485,7 +1496,7 @@ with tab_fcast:
 
         # ── By room type ──────────────────────────────────────────────────────
         st.markdown("**Occupancy by Room Type (Total Forecast)**")
-        rt_melt = fcast[["stay_date","total_std_occ","total_dlx_occ","total_ste_occ"]].melt(
+        rt_melt = fcast_filtered[["stay_date","total_std_occ","total_dlx_occ","total_ste_occ"]].melt(
             "stay_date",var_name="Room",value_name="Occ %")
         rt_melt["Room"] = rt_melt["Room"].str.replace("total_","").str.replace("_occ","").str.replace("std","Standard").str.replace("dlx","Deluxe").str.replace("ste","Suite")
         rtc = (alt.Chart(rt_melt).mark_line(strokeWidth=2,point=True)
@@ -1499,11 +1510,11 @@ with tab_fcast:
         st.altair_chart(rtc, use_container_width=True)
 
     except ImportError:
-        st.line_chart(fcast.set_index("stay_date")[["otb_occ_pct","pickup_occ_pct","total_occ_pct"]])
+        st.line_chart(fcast_filtered.set_index("stay_date")[["otb_occ_pct","pickup_occ_pct","total_occ_pct"]])
 
     # Room type table: always show (outside try so it appears even if charts hit an error)
     try:
-        rt_tbl = fcast[["stay_date", "total_std_occ", "total_dlx_occ", "total_ste_occ"]].copy()
+        rt_tbl = fcast_filtered[["stay_date", "total_std_occ", "total_dlx_occ", "total_ste_occ"]].copy()
         rt_tbl["stay_date"] = rt_tbl["stay_date"].dt.strftime("%Y-%m-%d")
         rt_tbl = rt_tbl.rename(columns={
             "stay_date": "Stay Date",
@@ -1520,7 +1531,7 @@ with tab_fcast:
 
     # ── Per-date table ────────────────────────────────────────────────────────
     st.markdown('<p class="sec">📋 Daily Forecast Detail</p>', unsafe_allow_html=True)
-    tbl = fcast[["stay_date","otb_rooms","otb_occ_pct","pickup_rooms","pickup_occ_pct",
+    tbl = fcast_filtered[["stay_date","otb_rooms","otb_occ_pct","pickup_rooms","pickup_occ_pct",
                  "total_rooms","total_occ_pct","total_revenue","total_adr","total_revpar",
                  "remaining_rooms"]].copy()
     tbl["stay_date"]    = tbl["stay_date"].dt.strftime("%a %d %b %Y")
@@ -1540,8 +1551,8 @@ with tab_fcast:
     st.dataframe(tbl, use_container_width=True, height=400)
 
     # Download
-    dl = fcast.copy(); dl["stay_date"] = dl["stay_date"].astype(str)
-    month_suffix = selected_month_name.replace(' ', '_')
+    dl = fcast_filtered.copy(); dl["stay_date"] = dl["stay_date"].astype(str)
+    month_suffix = selected_view_month.replace(' ', '_') if selected_view_month != "All Months" else selected_month_name.replace(' ', '_')
     st.download_button("⬇️ Download OTB-Anchored Forecast CSV",
                         dl.to_csv(index=False).encode(),
                         f"otb_forecast_{month_suffix}.csv","text/csv")
@@ -1550,27 +1561,27 @@ with tab_fcast:
     st.markdown('<p class="sec">💡 Key Insights</p>', unsafe_allow_html=True)
     i1,i2,i3 = st.columns(3)
     with i1:
-        high_otb = fcast.nlargest(3,"otb_occ_pct")[["stay_date","otb_occ_pct"]]
+        high_otb = fcast_filtered.nlargest(3,"otb_occ_pct")[["stay_date","otb_occ_pct"]]
         rows_str = "".join([f"• {r['stay_date'].strftime('%d %b')}: <b>{r['otb_occ_pct']:.1f}%</b><br>"
                             for _,r in high_otb.iterrows()])
         st.markdown(f"""<div class="insight"><b>🟢 Strongest OTB Dates</b><br>{rows_str}</div>""",
                     unsafe_allow_html=True)
     with i2:
-        low_otb = fcast.nsmallest(3,"otb_occ_pct")[["stay_date","otb_occ_pct","remaining_rooms"]]
+        low_otb = fcast_filtered.nsmallest(3,"otb_occ_pct")[["stay_date","otb_occ_pct","remaining_rooms"]]
         rows_str = "".join([f"• {r['stay_date'].strftime('%d %b')}: OTB {r['otb_occ_pct']:.1f}% "
                             f"({r['remaining_rooms']:.0f} rooms free)<br>"
                             for _,r in low_otb.iterrows()])
         st.markdown(f"""<div class="insight"><b>⚠️ Low OTB — Opportunity to Fill</b><br>{rows_str}</div>""",
                     unsafe_allow_html=True)
     with i3:
-        wk   = fcast["stay_date"].dt.dayofweek >= 5
+        wk   = fcast_filtered["stay_date"].dt.dayofweek >= 5
         st.markdown(f"""<div class="insight"><b>📅 Weekend vs Weekday</b><br>
-        OTB: <b>{fcast[wk]['otb_occ_pct'].mean():.1f}%</b> vs
-              <b>{fcast[~wk]['otb_occ_pct'].mean():.1f}%</b><br>
-        Total: <b>{fcast[wk]['total_occ_pct'].mean():.1f}%</b> vs
-               <b>{fcast[~wk]['total_occ_pct'].mean():.1f}%</b><br>
-        Revenue: <b>{fmt(fcast[wk]['total_revenue'].mean())}</b> vs
-                 <b>{fmt(fcast[~wk]['total_revenue'].mean())}</b>
+        OTB: <b>{fcast_filtered[wk]['otb_occ_pct'].mean():.1f}%</b> vs
+              <b>{fcast_filtered[~wk]['otb_occ_pct'].mean():.1f}%</b><br>
+        Total: <b>{fcast_filtered[wk]['total_occ_pct'].mean():.1f}%</b> vs
+               <b>{fcast_filtered[~wk]['total_occ_pct'].mean():.1f}%</b><br>
+        Revenue: <b>{fmt(fcast_filtered[wk]['total_revenue'].mean())}</b> vs
+                 <b>{fmt(fcast_filtered[~wk]['total_revenue'].mean())}</b>
         </div>""", unsafe_allow_html=True)
 
 
