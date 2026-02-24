@@ -892,6 +892,8 @@ def forecast_otb_anchored(ts_models, feat_cols, daily, otb_df, horizon=30):
 
         # Recalculate all lag features with the full history
         history = _add_lags(history, all_ts_targets)
+        # Re-find the index after _add_lags returns a new DataFrame
+        idx = history[history["stay_date"] == next_date].index[0]
         row_f   = history.loc[[idx], feat_cols]
 
         # Fill any remaining NaNs with recent means instead of zeros
