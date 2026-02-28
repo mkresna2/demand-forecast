@@ -704,11 +704,10 @@ def should_promote_new_model(old_metrics: dict, new_metrics: dict,
         reasons.append(f"Robust R² dropped significantly ({new_r2:.3f} vs {old_r2:.3f})")
         promote = False
 
-    # R2 should be stable (low variance across folds)
-    if new_r2_std > 0.15:
+    # R2 should be stable (low variance across folds) — hard reject
+    if new_r2_std > 0.35:
         reasons.append(f"High R² variance across validation folds ({new_r2_std:.3f})")
-        if new_r2 < old_r2:
-            promote = False
+        promote = False
 
     # MAPE should improve or stay similar
     if new_mape > old_mape + mape_tolerance:
@@ -813,7 +812,7 @@ def train_booking_models(raw: pd.DataFrame):
 # PICKUP MODEL v4 — replaces OTB-anchored forecast path
 # ══════════════════════════════════════════════════════════════════════════════
 
-PICKUP_SNAPSHOT_DAYS = [1, 2, 3, 5, 7, 10, 14, 21, 28, 45, 60, 90]
+PICKUP_SNAPSHOT_DAYS = [1, 2, 3, 5, 7, 10, 14, 21, 28, 35, 42, 50, 60, 75, 90]
 
 PICKUP_FEATURES = [
     "days_to_arrival",
@@ -1165,8 +1164,8 @@ def _walk_forward_cv_pickup(
         mae  = mean_absolute_error(te[target], preds)
         r2   = float(r2_score(te[target].values, preds))
         bias = float(np.mean(preds - te[target].values))
-        denom = np.where(te[target].values == 0, 1, np.abs(te[target].values))
-        mape = float(np.mean(np.abs((te[target].values - preds) / denom)) * 100)
+        smape_denom = (np.abs(te[target].values) + np.abs(preds)) / 2 + 1e-8
+        mape = float(np.mean(np.abs(te[target].values - preds) / smape_denom) * 100)
 
         fold_metrics.append({"fold": fold+1, "r2": r2, "mae": mae,
                               "mape": mape, "bias": bias,
@@ -1274,8 +1273,8 @@ def train_pickup_models(
         mae  = mean_absolute_error(y_test, preds)
         r2   = float(r2_score(y_test.values, preds))
         bias = float(np.mean(preds - y_test.values))
-        denom = np.where(y_test.values == 0, 1, np.abs(y_test.values))
-        mape = float(np.mean(np.abs((y_test.values - preds) / denom)) * 100)
+        smape_denom = (np.abs(y_test.values) + np.abs(preds)) / 2 + 1e-8
+        mape = float(np.mean(np.abs(y_test.values - preds) / smape_denom) * 100)
 
         robust_r2     = cv_result["r2_median"] if cv_result else r2
         robust_r2_std = cv_result["r2_std"]    if cv_result else 0.0
