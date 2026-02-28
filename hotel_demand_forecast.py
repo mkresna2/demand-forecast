@@ -1651,8 +1651,8 @@ def forecast_otb_anchored(ts_models, feat_cols, ts_metrics, daily, otb_df, horiz
         total_dlx_occ = min((row_otb["dlx_otb"] + pickup_dlx)/CAPACITY["Deluxe"]*100, 100)
         total_ste_occ = min((row_otb["ste_otb"] + pickup_ste)/CAPACITY["Suite"]*100, 100)
 
-        history.at[history.index[-1], "revpar"] = total_revenue / CAPACITY["total"]
-        history.at[history.index[-1], "rooms_occupied"] = total_rooms
+        history.at[idx, "revpar"] = total_revenue / CAPACITY["total"]
+        history.at[idx, "rooms_occupied"] = total_rooms
 
         records.append({
             "stay_date":        next_date,
