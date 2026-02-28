@@ -58,9 +58,20 @@ def init_db() -> None:
                 cancel_metrics_text TEXT,
                 m_los_blob BLOB,
                 los_metrics_text TEXT,
+                pickup_models_blob BLOB,
+                pickup_metrics_text TEXT,
                 updated_at TEXT
             )
         """)
+        # Migration: add pickup columns to existing tables
+        try:
+            conn.execute("ALTER TABLE user_sessions ADD COLUMN pickup_models_blob BLOB")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        try:
+            conn.execute("ALTER TABLE user_sessions ADD COLUMN pickup_metrics_text TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already exists
         conn.commit()
 
 
@@ -117,19 +128,30 @@ def save_session(username: str, state: dict) -> None:
         if los_metrics else None
     )
 
+    pickup_models = state.get("pickup_models")
+    pickup_models_blob = pickle.dumps(pickup_models) if pickup_models else None
+
+    pickup_metrics = state.get("pickup_metrics")
+    pickup_metrics_text = (
+        base64.b64encode(pickle.dumps(pickup_metrics)).decode("ascii")
+        if pickup_metrics else None
+    )
+
     with _get_conn() as conn:
         conn.execute("""
             INSERT OR REPLACE INTO user_sessions (
                 username, raw_blob, expanded_blob, daily_blob, ts_df_blob,
                 ts_models_blob, ts_metrics_text, ts_feat_cols_text,
                 m_cancel_blob, cancel_metrics_text, m_los_blob, los_metrics_text,
+                pickup_models_blob, pickup_metrics_text,
                 updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             username,
             raw_blob, expanded_blob, daily_blob, ts_df_blob,
             ts_models_blob, ts_metrics_text, ts_feat_cols_text,
             m_cancel_blob, cancel_metrics_text, m_los_blob, los_metrics_text,
+            pickup_models_blob, pickup_metrics_text,
             now,
         ))
         conn.commit()
@@ -161,6 +183,13 @@ def load_session(username: str) -> Optional[dict]:
     state["cancel_metrics"] = _load_metrics_text(row["cancel_metrics_text"])
     state["m_los"] = pickle.loads(row["m_los_blob"]) if row["m_los_blob"] else None
     state["los_metrics"] = _load_metrics_text(row["los_metrics_text"])
+
+    # Pickup model v4 artifacts
+    pm_blob = row["pickup_models_blob"] if "pickup_models_blob" in row.keys() else None
+    state["pickup_models"] = pickle.loads(pm_blob) if pm_blob else None
+    pm_text = row["pickup_metrics_text"] if "pickup_metrics_text" in row.keys() else None
+    state["pickup_metrics"] = _load_metrics_text(pm_text)
+
     return state
 
 

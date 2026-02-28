@@ -1319,6 +1319,35 @@ def forecast_with_pickup_models(
     pace_df     = _compute_inference_pace(raw, as_of_date, capacity["total"])
     pace_lookup = pace_df.set_index("stay_date").to_dict("index") if len(pace_df) > 0 else {}
 
+    # FIX 7 — DTA-aware pace fallback from training data
+    # During training, pace features are non-zero (historical bookings exist).
+    # At inference, dates without recent bookings get pace=0, causing
+    # distribution shift that pushes all dates into the same LightGBM leaf.
+    # Fix: use training-mean pace for the nearest DTA as fallback.
+    _pf = st.session_state.get("pickup_df")
+    if _pf is not None and len(_pf) > 0:
+        _pace_cols = ["pace_7d", "pace_14d", "pace_30d"]
+        _existing  = [c for c in _pace_cols if c in _pf.columns]
+        if _existing:
+            pace_fallback_df = _pf.groupby("days_to_arrival")[_existing].mean()
+        else:
+            pace_fallback_df = pd.DataFrame()
+    else:
+        pace_fallback_df = pd.DataFrame()
+
+    def _get_pace_fallback(dta_val):
+        """Return training-mean pace for the nearest DTA in pickup training data."""
+        if pace_fallback_df.empty:
+            return 0.0, 0.0, 0.0
+        idx = pace_fallback_df.index
+        nearest = idx[np.abs(idx - dta_val).argmin()]
+        row = pace_fallback_df.loc[nearest]
+        return (
+            float(row.get("pace_7d",  0.0)),
+            float(row.get("pace_14d", 0.0)),
+            float(row.get("pace_30d", 0.0)),
+        )
+
     # Compute month-aware pace baselines for fill_rate — mirrors training computation
     conf      = raw[raw["Cancellation_Status"] == "Confirmed"].copy()
     conf["Check_in_Date"] = pd.to_datetime(conf["Check_in_Date"])
@@ -1341,10 +1370,13 @@ def forecast_with_pickup_models(
         otb_adr     = float(row_otb["adr_otb"]) if row_otb["adr_otb"] > 0 else 0.0
         remaining   = float(row_otb["remaining_rooms"])
 
-        pace_entry = pace_lookup.get(stay_date, {})
-        pace_7d    = float(pace_entry.get("pace_7d",  0.0))
-        pace_14d   = float(pace_entry.get("pace_14d", 0.0))
-        pace_30d   = float(pace_entry.get("pace_30d", 0.0))
+        pace_entry = pace_lookup.get(stay_date, None)
+        if pace_entry is not None:
+            pace_7d  = float(pace_entry.get("pace_7d",  0.0))
+            pace_14d = float(pace_entry.get("pace_14d", 0.0))
+            pace_30d = float(pace_entry.get("pace_30d", 0.0))
+        else:
+            pace_7d, pace_14d, pace_30d = _get_pace_fallback(dta)
 
         days_elapsed       = max(90 - dta, 0)
         month_pace         = monthly_pace.get(stay_date.month, global_pace)
