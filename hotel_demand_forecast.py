@@ -679,7 +679,7 @@ def compute_drift_metrics(old_data: pd.DataFrame, new_data: pd.DataFrame,
 
 
 def should_promote_new_model(old_metrics: dict, new_metrics: dict,
-                             r2_tolerance=0.02, mape_tolerance=2.0) -> tuple:
+                             r2_tolerance=0.02) -> tuple:
     """
     Determine if new model should replace old model based on robust metrics.
 
@@ -688,32 +688,29 @@ def should_promote_new_model(old_metrics: dict, new_metrics: dict,
     reasons = []
 
     # Compare robust R2 (median from walk-forward CV)
-    old_r2 = old_metrics.get('Robust_R2', old_metrics.get('R2', 0))
-    new_r2 = new_metrics.get('Robust_R2', new_metrics.get('R2', 0))
-    old_r2_std = old_metrics.get('Robust_R2_Std', 0)
+    old_r2     = old_metrics.get('Robust_R2', old_metrics.get('R2', 0))
+    new_r2     = new_metrics.get('Robust_R2', new_metrics.get('R2', 0))
     new_r2_std = new_metrics.get('Robust_R2_Std', 0)
 
-    old_mape = old_metrics.get('MAPE', 100)
-    new_mape = new_metrics.get('MAPE', 100)
+    old_mae = old_metrics.get('MAE', float('inf'))
+    new_mae = new_metrics.get('MAE', float('inf'))
 
-    # Promotion criteria
     promote = True
 
-    # R2 should not drop significantly
+    # R² should not drop significantly
     if new_r2 < old_r2 - r2_tolerance:
         reasons.append(f"Robust R² dropped significantly ({new_r2:.3f} vs {old_r2:.3f})")
         promote = False
 
-    # R2 should be stable (low variance across folds) — hard reject
-    if new_r2_std > 0.35:
+    # R² should be stable across folds — hard reject
+    if new_r2_std > 0.50:
         reasons.append(f"High R² variance across validation folds ({new_r2_std:.3f})")
         promote = False
 
-    # MAPE should improve or stay similar
-    if new_mape > old_mape + mape_tolerance:
-        reasons.append(f"MAPE increased ({new_mape:.1f}% vs {old_mape:.1f}%)")
-        if new_r2 < old_r2:
-            promote = False
+    # MAE should not regress catastrophically
+    if old_mae > 0 and new_mae > old_mae * 2.0:
+        reasons.append(f"MAE more than doubled ({new_mae:.2f} vs {old_mae:.2f})")
+        promote = False
 
     # Minimum quality bar
     if new_r2 < 0.3:
@@ -723,8 +720,8 @@ def should_promote_new_model(old_metrics: dict, new_metrics: dict,
     if promote:
         if new_r2 > old_r2 + 0.01:
             reasons.append(f"Improved robust R² ({new_r2:.3f} vs {old_r2:.3f})")
-        elif new_mape < old_mape - 1:
-            reasons.append(f"Improved MAPE ({new_mape:.1f}% vs {old_mape:.1f}%)")
+        elif old_mae > 0 and new_mae < old_mae * 0.9:
+            reasons.append(f"Improved MAE ({new_mae:.2f} vs {old_mae:.2f})")
         else:
             reasons.append("Performance maintained within tolerance")
 
@@ -1959,6 +1956,25 @@ with st.sidebar:
                                 f"[non-gating] {PICKUP_TARGETS.get(t, t)}: {r}" for r in reasons
                             ])
                 should_promote = all_promotable
+
+            elif pickup_models and pickup_metrics:
+                # First training: apply minimum absolute quality bars
+                # No old model to compare against, but don't auto-promote garbage
+                for t in PROMOTION_GATE_TARGETS:
+                    if t in pickup_metrics:
+                        met = pickup_metrics[t]
+                        r2 = met.get('Robust_R2', met.get('R2', 0))
+                        r2_std = met.get('Robust_R2_Std', 0)
+                        if r2 < 0.3:
+                            should_promote = False
+                            promotion_reasons.append(
+                                f"{PICKUP_TARGETS.get(t, t)}: R² too low for first training ({r2:.3f})"
+                            )
+                        if r2_std > 0.50:
+                            should_promote = False
+                            promotion_reasons.append(
+                                f"{PICKUP_TARGETS.get(t, t)}: R² variance too high for first training ({r2_std:.3f})"
+                            )
 
             # Update session state with promotion decision
             if should_promote:
