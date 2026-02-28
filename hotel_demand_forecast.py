@@ -200,16 +200,21 @@ def get_otb(raw: pd.DataFrame, as_of_date: pd.Timestamp, horizon: int) -> pd.Dat
         otb = all_dates.copy()
         for col in ["rooms_otb","revenue_otb","std_otb","dlx_otb","ste_otb","adr_otb"]:
             otb[col] = 0.0
+        for ch in CHANNELS:
+            otb[ch] = 0.0
     else:
         exp = pd.DataFrame(rows)
-        otb = exp.groupby("stay_date").agg(
-            rooms_otb   = ("Booked_Rate", "count"),
-            revenue_otb = ("Booked_Rate", "sum"),
-            std_otb     = ("Room_Type", lambda x: (x == "Standard").sum()),
-            dlx_otb     = ("Room_Type", lambda x: (x == "Deluxe").sum()),
-            ste_otb     = ("Room_Type", lambda x: (x == "Suite").sum()),
-            adr_otb     = ("Booked_Rate", "mean"),
-        ).reset_index()
+        agg_dict = {
+            "rooms_otb":   ("Booked_Rate", "count"),
+            "revenue_otb": ("Booked_Rate", "sum"),
+            "std_otb":     ("Room_Type", lambda x: (x == "Standard").sum()),
+            "dlx_otb":     ("Room_Type", lambda x: (x == "Deluxe").sum()),
+            "ste_otb":     ("Room_Type", lambda x: (x == "Suite").sum()),
+            "adr_otb":     ("Booked_Rate", "mean"),
+        }
+        for ch in CHANNELS:
+            agg_dict[ch] = ("Booking_Channel", lambda x, ch=ch: (x == ch).sum())
+        otb = exp.groupby("stay_date").agg(**agg_dict).reset_index()
         otb = all_dates.merge(otb, on="stay_date", how="left").fillna(0)
 
     otb["occ_pct_otb"]    = otb["rooms_otb"]   / CAPACITY["total"]    * 100
@@ -805,7 +810,670 @@ def train_booking_models(raw: pd.DataFrame):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# OTB-ANCHORED FORECAST ENGINE
+# PICKUP MODEL v4 — replaces OTB-anchored forecast path
+# ══════════════════════════════════════════════════════════════════════════════
+
+PICKUP_SNAPSHOT_DAYS = [1, 2, 3, 5, 7, 10, 14, 21, 28, 45, 60, 90]
+
+PICKUP_FEATURES = [
+    "days_to_arrival",
+    "otb_occ_pct",
+    "otb_rooms",
+    "remaining_pct",
+    "remaining_rooms",
+    "fill_rate",          # NEW in v4
+    "pace_7d",
+    "pace_7d_pct",
+    "pace_14d",
+    "pace_14d_pct",
+    "pace_30d",
+    "pace_30d_pct",
+    "otb_std",
+    "otb_dlx",
+    "otb_ste",
+    "otb_adr",
+    "dow",
+    "month",
+    "week",
+    "quarter",
+    "is_weekend",
+    "dom",
+    "doy",
+    "month_sin",
+    "month_cos",
+    "dow_sin",
+    "dow_cos",
+]
+
+PICKUP_TARGETS = {
+    "pickup_occ_pct":  "Pickup Occ %",
+    "pickup_rooms":    "Pickup Rooms",
+    "pickup_revenue":  "Pickup Revenue",
+    "final_occ_pct":   "Final Occ % (total)",
+    "final_revenue":   "Final Revenue (total)",
+    "final_adr":       "Final ADR",
+}
+
+PROMOTION_GATE_TARGETS = ["pickup_occ_pct", "pickup_rooms", "pickup_revenue"]
+
+
+def _compute_monthly_pace_baselines(
+    conf: pd.DataFrame,
+    capacity_total: int,
+    lead_days_max: int = 90,
+    min_month_stay_dates: int = 20,
+) -> tuple[dict, float]:
+    """
+    Compute average daily booking pace per month for fill_rate calculations.
+    
+    Returns a tuple of (monthly_pace_dict, global_pace_fallback).
+    monthly_pace maps month (1-12) to avg_daily_pace for that month.
+    global_pace is used as fallback for months with sparse data.
+    """
+    conf = conf.copy()
+    conf["Check_in_Date"] = pd.to_datetime(conf["Check_in_Date"])
+    conf["Booking_Date"] = pd.to_datetime(conf["Booking_Date"])
+    if "Check_out_Date" in conf.columns:
+        conf["Check_out_Date"] = pd.to_datetime(conf["Check_out_Date"])
+    else:
+        conf["Check_out_Date"] = conf["Check_in_Date"] + timedelta(days=1)
+
+    # Expand to stay-night granularity so pace aligns with stay_date targets.
+    stay_rows = []
+    for r in conf.itertuples(index=False):
+        bdate = pd.Timestamp(r.Booking_Date)
+        ci = pd.Timestamp(r.Check_in_Date)
+        co = pd.Timestamp(r.Check_out_Date)
+        for stay_date in pd.date_range(ci, co - timedelta(days=1)):
+            lead = (pd.Timestamp(stay_date) - bdate).days
+            if 0 <= lead <= lead_days_max:
+                stay_rows.append({
+                    "stay_date": pd.Timestamp(stay_date),
+                    "month": pd.Timestamp(stay_date).month,
+                })
+
+    if not stay_rows:
+        warnings.warn(
+            "No valid stay-night leads found in pace baseline computation; using tiny global fallback pace."
+        )
+        return {}, 1e-6
+
+    valid = pd.DataFrame(stay_rows)
+
+    # Compute unique stay dates per month for normalization.
+    monthly_stay_dates = valid.groupby("month")["stay_date"].nunique().to_dict()
+
+    # Count valid stay-night leads per month.
+    monthly_lead_counts = valid.groupby("month").size().to_dict()
+
+    # Compute monthly pace: leads / (max_lead_days * unique_stay_dates).
+    monthly_pace = {}
+    for month, lead_count in monthly_lead_counts.items():
+        n_stay_dates = max(monthly_stay_dates.get(month, 1), 1)
+        monthly_pace[month] = lead_count / (lead_days_max * n_stay_dates)
+
+    # Global fallback pace (average across valid stay-night lead-window data).
+    global_stay_dates = max(valid["stay_date"].nunique(), 1)
+    global_pace = len(valid) / (lead_days_max * global_stay_dates)
+
+    # Guard sparse months by falling back to global pace.
+    for month in list(monthly_pace.keys()):
+        if monthly_stay_dates.get(month, 0) < min_month_stay_dates:
+            monthly_pace[month] = global_pace
+
+    # Sanity checks to catch silent denominator/filter regressions.
+    invalid_months = {
+        m: v for m, v in monthly_pace.items()
+        if (not np.isfinite(v)) or v <= 1e-6 or v > 5.0
+    }
+    assert np.isfinite(global_pace) and 1e-6 < global_pace <= 5.0, (
+        f"Suspicious global pace value: {global_pace}"
+    )
+    assert not invalid_months, f"Suspicious monthly pace values: {invalid_months}"
+    
+    return monthly_pace, global_pace
+
+
+def _compute_inference_pace(
+    raw: pd.DataFrame,
+    as_of_date: pd.Timestamp,
+    capacity_total: int,
+) -> pd.DataFrame:
+    """
+    Compute real booking pace (7d, 14d, 30d) for all future stay dates.
+    Mirrors the pace calculation in build_pickup_training_data() exactly,
+    so there is no feature drift between train and inference.
+    """
+    conf = raw[raw["Cancellation_Status"] == "Confirmed"].copy()
+    conf["Check_in_Date"]  = pd.to_datetime(conf["Check_in_Date"])
+    conf["Check_out_Date"] = pd.to_datetime(conf["Check_out_Date"])
+    conf["Booking_Date"]   = pd.to_datetime(conf["Booking_Date"])
+
+    w30_start = as_of_date - timedelta(days=30)
+    recent = conf[
+        (conf["Booking_Date"] > w30_start) &
+        (conf["Booking_Date"] <= as_of_date)
+    ]
+
+    rows = []
+    for _, r in recent.iterrows():
+        bdate = r["Booking_Date"]
+        for d in pd.date_range(r["Check_in_Date"],
+                               r["Check_out_Date"] - timedelta(days=1)):
+            rows.append({"stay_date": pd.Timestamp(d), "Booking_Date": bdate})
+
+    if not rows:
+        return pd.DataFrame(columns=[
+            "stay_date", "pace_7d", "pace_7d_pct",
+            "pace_14d", "pace_14d_pct", "pace_30d", "pace_30d_pct",
+        ])
+
+    expanded  = pd.DataFrame(rows)
+    w7_start  = as_of_date - timedelta(days=7)
+    w14_start = as_of_date - timedelta(days=14)
+
+    result = expanded.groupby("stay_date").apply(
+        lambda g: pd.Series({
+            "pace_7d":  (g["Booking_Date"] > w7_start).sum(),
+            "pace_14d": (g["Booking_Date"] > w14_start).sum(),
+            "pace_30d": len(g),
+        })
+    ).reset_index()
+
+    result["pace_7d_pct"]  = result["pace_7d"]  / capacity_total * 100
+    result["pace_14d_pct"] = result["pace_14d"] / capacity_total * 100
+    result["pace_30d_pct"] = result["pace_30d"] / capacity_total * 100
+    return result
+
+
+def build_pickup_training_data(
+    raw: pd.DataFrame,
+    capacity: dict = None,
+) -> pd.DataFrame:
+    """
+    Synthesise a pickup training table from raw booking-level data.
+
+    For each (stay_date, snapshot_day) pair computes OTB state, booking pace,
+    fill_rate, and calendar features. Target is pickup (can be negative = wash).
+    """
+    if capacity is None:
+        capacity = CAPACITY
+
+    conf = raw[raw["Cancellation_Status"] == "Confirmed"].copy()
+    conf["Check_in_Date"]  = pd.to_datetime(conf["Check_in_Date"])
+    conf["Check_out_Date"] = pd.to_datetime(conf["Check_out_Date"])
+    conf["Booking_Date"]   = pd.to_datetime(conf["Booking_Date"])
+
+    stay_rows = []
+    for _, r in conf.iterrows():
+        for d in pd.date_range(r["Check_in_Date"],
+                               r["Check_out_Date"] - timedelta(days=1)):
+            stay_rows.append({
+                "stay_date":       d,
+                "Booking_Date":    r["Booking_Date"],
+                "Room_Type":       r["Room_Type"],
+                "Booked_Rate":     r["Booked_Rate"],
+                "Booking_Channel": r["Booking_Channel"],
+            })
+    stay_df = pd.DataFrame(stay_rows)
+
+    finals = stay_df.groupby("stay_date").agg(
+        final_rooms   = ("Booked_Rate", "count"),
+        final_revenue = ("Booked_Rate", "sum"),
+        final_std     = ("Room_Type",   lambda x: (x == "Standard").sum()),
+        final_dlx     = ("Room_Type",   lambda x: (x == "Deluxe").sum()),
+        final_ste     = ("Room_Type",   lambda x: (x == "Suite").sum()),
+    ).reset_index()
+    finals["final_occ_pct"] = finals["final_rooms"] / capacity["total"] * 100
+    finals["final_adr"]     = finals["final_revenue"] / finals["final_rooms"].clip(lower=1)
+    finals = finals[finals["final_rooms"] > 0].reset_index(drop=True)
+
+    # Compute month-aware pace baselines for fill_rate (fix for seasonal flatness)
+    monthly_pace, global_pace = _compute_monthly_pace_baselines(
+        conf, capacity["total"], lead_days_max=90
+    )
+
+    records = []
+    for stay_date in finals["stay_date"].values:
+        stay_ts        = pd.Timestamp(stay_date)
+        night_bookings = stay_df[stay_df["stay_date"] == stay_ts]
+
+        for dta in PICKUP_SNAPSHOT_DAYS:
+            as_of    = stay_ts - timedelta(days=dta)
+            otb_mask = night_bookings["Booking_Date"] <= as_of
+            otb_rows = night_bookings[otb_mask]
+
+            otb_rooms   = len(otb_rows)
+            otb_revenue = otb_rows["Booked_Rate"].sum()
+            otb_std     = (otb_rows["Room_Type"] == "Standard").sum()
+            otb_dlx     = (otb_rows["Room_Type"] == "Deluxe").sum()
+            otb_ste     = (otb_rows["Room_Type"] == "Suite").sum()
+            otb_occ_pct = otb_rooms / capacity["total"] * 100
+            otb_adr     = otb_revenue / max(otb_rooms, 1)
+            remaining   = max(0, capacity["total"] - otb_rooms)
+
+            pace_7d  = len(night_bookings[
+                (night_bookings["Booking_Date"] > as_of - timedelta(days=7)) &
+                (night_bookings["Booking_Date"] <= as_of)
+            ])
+            pace_14d = len(night_bookings[
+                (night_bookings["Booking_Date"] > as_of - timedelta(days=14)) &
+                (night_bookings["Booking_Date"] <= as_of)
+            ])
+            pace_30d = len(night_bookings[
+                (night_bookings["Booking_Date"] > as_of - timedelta(days=30)) &
+                (night_bookings["Booking_Date"] <= as_of)
+            ])
+
+            # fill_rate: actual OTB vs expected at this DTA on the booking curve
+            # Use month-aware pace for seasonal accuracy, with global fallback
+            days_elapsed       = max(90 - dta, 0)
+            month_pace         = monthly_pace.get(stay_ts.month, global_pace)
+            expected_otb_rooms = month_pace * days_elapsed * capacity["total"]
+            fill_rate          = otb_rooms / max(expected_otb_rooms, 1)
+            fill_rate          = float(np.clip(fill_rate, 0.0, 8.0))
+
+            # FIX 2: NO max(0,...) — negative pickup (wash) is valid training signal
+            fin            = finals[finals["stay_date"] == stay_ts].iloc[0]
+            pickup_rooms   = int(fin["final_rooms"])   - otb_rooms
+            pickup_revenue = float(fin["final_revenue"]) - otb_revenue
+            pickup_occ_pct = pickup_rooms / capacity["total"] * 100
+
+            records.append({
+                "stay_date":       stay_ts,
+                "as_of_date":      as_of,
+                "days_to_arrival": dta,
+                "otb_rooms":       otb_rooms,
+                "otb_occ_pct":     otb_occ_pct,
+                "otb_revenue":     otb_revenue,
+                "otb_adr":         otb_adr,
+                "otb_std":         otb_std,
+                "otb_dlx":         otb_dlx,
+                "otb_ste":         otb_ste,
+                "remaining_rooms": remaining,
+                "remaining_pct":   remaining / capacity["total"] * 100,
+                "fill_rate":       fill_rate,
+                "pace_7d":         pace_7d,
+                "pace_7d_pct":     pace_7d  / capacity["total"] * 100,
+                "pace_14d":        pace_14d,
+                "pace_14d_pct":    pace_14d / capacity["total"] * 100,
+                "pace_30d":        pace_30d,
+                "pace_30d_pct":    pace_30d / capacity["total"] * 100,
+                "dow":             stay_ts.dayofweek,
+                "month":           stay_ts.month,
+                "week":            stay_ts.isocalendar()[1],
+                "quarter":         stay_ts.quarter,
+                "is_weekend":      int(stay_ts.dayofweek >= 5),
+                "year":            stay_ts.year,
+                "dom":             stay_ts.day,
+                "doy":             stay_ts.dayofyear,
+                "month_sin":       np.sin(2 * np.pi * stay_ts.month / 12),
+                "month_cos":       np.cos(2 * np.pi * stay_ts.month / 12),
+                "dow_sin":         np.sin(2 * np.pi * stay_ts.dayofweek / 7),
+                "dow_cos":         np.cos(2 * np.pi * stay_ts.dayofweek / 7),
+                "pickup_rooms":    pickup_rooms,
+                "pickup_occ_pct":  pickup_occ_pct,
+                "pickup_revenue":  pickup_revenue,
+                "final_rooms":     int(fin["final_rooms"]),
+                "final_occ_pct":   float(fin["final_occ_pct"]),
+                "final_revenue":   float(fin["final_revenue"]),
+                "final_adr":       float(fin["final_adr"]),
+            })
+
+    return pd.DataFrame(records).sort_values(
+        ["stay_date", "days_to_arrival"]
+    ).reset_index(drop=True)
+
+
+def _walk_forward_cv_pickup(
+    df: pd.DataFrame, feat_cols: list, target: str, n_folds: int = 5,
+) -> dict | None:
+    """Walk-forward CV on stay_date chronological order."""
+    import lightgbm as lgb
+    from sklearn.metrics import mean_absolute_error, r2_score
+
+    unique_dates = df["stay_date"].sort_values().unique()
+    fold_size    = max(1, len(unique_dates) // (n_folds + 1))
+    fold_metrics = []
+    fold_imps    = []
+
+    for fold in range(n_folds):
+        train_end = fold_size * (fold + 1)
+        test_end  = min(fold_size * (fold + 2), len(unique_dates))
+        if train_end >= len(unique_dates): break
+
+        tr_dates = unique_dates[:train_end]
+        te_dates = unique_dates[train_end:test_end]
+        if len(te_dates) == 0: break
+
+        tr = df[df["stay_date"].isin(tr_dates)]
+        te = df[df["stay_date"].isin(te_dates)]
+        if tr[target].nunique() <= 1 or te[target].nunique() <= 1: continue
+
+        m = lgb.LGBMRegressor(
+            objective="regression",
+            n_estimators=800, learning_rate=0.02,
+            max_depth=6, num_leaves=31,
+            min_child_samples=20,
+            subsample=0.8, colsample_bytree=0.8,
+            reg_alpha=0.1, reg_lambda=0.2,
+            random_state=42 + fold, verbose=-1,
+        )
+        m.fit(tr[feat_cols], tr[target])
+        preds = m.predict(te[feat_cols])
+
+        mae  = mean_absolute_error(te[target], preds)
+        r2   = float(r2_score(te[target].values, preds))
+        bias = float(np.mean(preds - te[target].values))
+        denom = np.where(te[target].values == 0, 1, np.abs(te[target].values))
+        mape = float(np.mean(np.abs((te[target].values - preds) / denom)) * 100)
+
+        fold_metrics.append({"fold": fold+1, "r2": r2, "mae": mae,
+                              "mape": mape, "bias": bias,
+                              "dates": te["stay_date"].values,
+                              "preds": preds, "actual": te[target].values})
+        fold_imps.append(m.feature_importances_)
+
+    if not fold_metrics: return None
+
+    imp_arr   = np.array(fold_imps)
+    imp_mean  = imp_arr.mean(axis=0)
+    imp_std   = imp_arr.std(axis=0)
+    stability = np.where(imp_mean > 0, 1 - (imp_std / (imp_mean + 1e-8)), 0)
+
+    r2s    = [f["r2"]   for f in fold_metrics]
+    maes   = [f["mae"]  for f in fold_metrics]
+    mapes  = [f["mape"] for f in fold_metrics]
+    biases = [f["bias"] for f in fold_metrics]
+
+    return {
+        "folds": fold_metrics,
+        "r2_mean": float(np.mean(r2s)),   "r2_std": float(np.std(r2s)),
+        "r2_median": float(np.median(r2s)), "r2_min": float(np.min(r2s)),
+        "r2_max": float(np.max(r2s)),
+        "mae_mean": float(np.mean(maes)),  "mape_mean": float(np.mean(mapes)),
+        "bias_mean": float(np.mean(biases)),
+        "importance_mean": imp_mean, "importance_stability": stability,
+        "n_folds": len(fold_metrics),
+    }
+
+
+def train_pickup_models(
+    raw:              pd.DataFrame,
+    use_walk_forward: bool = True,
+    capacity:         dict = None,
+) -> tuple:
+    """Train pickup models. Returns (models, metrics, pickup_df, cv_results)."""
+    if capacity is None:
+        capacity = CAPACITY
+
+    import lightgbm as lgb
+    from sklearn.metrics import mean_absolute_error, r2_score
+
+    pickup_df    = build_pickup_training_data(raw, capacity=capacity)
+    unique_dates = pickup_df["stay_date"].sort_values().unique()
+    split_date   = unique_dates[int(len(unique_dates) * 0.8)]
+
+    train_mask = pickup_df["stay_date"] <  split_date
+    test_mask  = pickup_df["stay_date"] >= split_date
+    X_train    = pickup_df.loc[train_mask, PICKUP_FEATURES]
+    X_test     = pickup_df.loc[test_mask,  PICKUP_FEATURES]
+
+    pickup_models  = {}
+    pickup_metrics = {}
+    cv_results     = {}
+
+    for target, label in PICKUP_TARGETS.items():
+        y_train = pickup_df.loc[train_mask, target]
+        y_test  = pickup_df.loc[test_mask,  target]
+
+        if y_train.nunique() <= 1:
+            continue
+
+        cv_result = None
+        if use_walk_forward and len(X_train) >= 200:
+            cv_result = _walk_forward_cv_pickup(
+                pickup_df[train_mask].reset_index(drop=True),
+                PICKUP_FEATURES, target,
+            )
+            cv_results[target] = cv_result
+
+        # FIX 1: regression (MSE) not Tweedie — aligns loss with R metric
+        # FIX 4: num_leaves = 2^(max_depth-1) to avoid train/test split fighting
+        if "occ_pct" in target or "rooms" in target:
+            params = dict(
+                objective="regression",
+                n_estimators=2000, learning_rate=0.015,
+                max_depth=6, num_leaves=31,
+                min_child_samples=25,
+                subsample=0.8, colsample_bytree=0.8,
+                reg_alpha=0.1, reg_lambda=0.2,
+                random_state=42, verbose=-1,
+            )
+        else:
+            params = dict(
+                objective="regression",
+                n_estimators=2000, learning_rate=0.015,
+                max_depth=5, num_leaves=15,
+                min_child_samples=25,
+                subsample=0.8, colsample_bytree=0.8,
+                reg_alpha=0.2, reg_lambda=0.3,
+                random_state=42, verbose=-1,
+            )
+
+        m = lgb.LGBMRegressor(**params)
+        m.fit(X_train, y_train,
+              eval_set=[(X_test, y_test)],
+              callbacks=[lgb.early_stopping(100, verbose=False)])
+
+        # FIX 2: no clip at eval — measure true error including wash days
+        preds = m.predict(X_test)
+        if "occ_pct" in target:
+            preds = np.minimum(preds, 100.0)
+
+        mae  = mean_absolute_error(y_test, preds)
+        r2   = float(r2_score(y_test.values, preds))
+        bias = float(np.mean(preds - y_test.values))
+        denom = np.where(y_test.values == 0, 1, np.abs(y_test.values))
+        mape = float(np.mean(np.abs((y_test.values - preds) / denom)) * 100)
+
+        robust_r2     = cv_result["r2_median"] if cv_result else r2
+        robust_r2_std = cv_result["r2_std"]    if cv_result else 0.0
+        r2_range      = (cv_result["r2_min"], cv_result["r2_max"]) if cv_result else (r2, r2)
+
+        pickup_models[target]  = m
+        pickup_metrics[target] = {
+            "label":             label,
+            "MAE":               mae,
+            "MAPE":              mape,
+            "R2":                r2,
+            "Bias":              bias,
+            "Robust_R2":         robust_r2,
+            "Robust_R2_Std":     robust_r2_std,
+            "Expected_R2_Range": r2_range,
+            "test_preds":        preds,
+            "test_actual":       y_test.values,
+            "test_dates":        pickup_df.loc[test_mask, "stay_date"].values,
+            "features":          PICKUP_FEATURES,
+            "importances":       m.feature_importances_,
+            "n_features":        len(PICKUP_FEATURES),
+        }
+
+    return pickup_models, pickup_metrics, pickup_df, cv_results
+
+
+def forecast_with_pickup_models(
+    pickup_models: dict,
+    otb_df:        pd.DataFrame,
+    as_of_date:    pd.Timestamp,
+    raw:           pd.DataFrame,
+    capacity:      dict = None,
+    channels:      list = None,
+    allow_wash:    bool = True,
+) -> pd.DataFrame:
+    """
+    Forecast using pickup-trained models.
+    Computes real pace before the loop (no zero-pace drift).
+    Respects allow_wash for negative pickup handling.
+    """
+    if capacity is None: capacity = CAPACITY
+    if channels is None: channels = CHANNELS
+
+    # FIX 3 — real pace, computed once before the loop
+    pace_df     = _compute_inference_pace(raw, as_of_date, capacity["total"])
+    pace_lookup = pace_df.set_index("stay_date").to_dict("index") if len(pace_df) > 0 else {}
+
+    # Compute month-aware pace baselines for fill_rate — mirrors training computation
+    conf      = raw[raw["Cancellation_Status"] == "Confirmed"].copy()
+    conf["Check_in_Date"] = pd.to_datetime(conf["Check_in_Date"])
+    conf["Booking_Date"]  = pd.to_datetime(conf["Booking_Date"])
+    monthly_pace, global_pace = _compute_monthly_pace_baselines(
+        conf, capacity["total"], lead_days_max=90
+    )
+
+    records = []
+    for _, row_otb in otb_df.reset_index(drop=True).iterrows():
+        stay_date = pd.Timestamp(row_otb["stay_date"])
+        dta       = (stay_date - as_of_date).days
+
+        otb_rooms   = float(row_otb["rooms_otb"])
+        otb_revenue = float(row_otb["revenue_otb"])
+        otb_occ     = float(row_otb["occ_pct_otb"])
+        otb_std     = float(row_otb["std_otb"])
+        otb_dlx     = float(row_otb["dlx_otb"])
+        otb_ste     = float(row_otb["ste_otb"])
+        otb_adr     = float(row_otb["adr_otb"]) if row_otb["adr_otb"] > 0 else 0.0
+        remaining   = float(row_otb["remaining_rooms"])
+
+        pace_entry = pace_lookup.get(stay_date, {})
+        pace_7d    = float(pace_entry.get("pace_7d",  0.0))
+        pace_14d   = float(pace_entry.get("pace_14d", 0.0))
+        pace_30d   = float(pace_entry.get("pace_30d", 0.0))
+
+        days_elapsed       = max(90 - dta, 0)
+        month_pace         = monthly_pace.get(stay_date.month, global_pace)
+        expected_otb_rooms = month_pace * days_elapsed * capacity["total"]
+        fill_rate          = otb_rooms / max(expected_otb_rooms, 1)
+        fill_rate          = float(np.clip(fill_rate, 0.0, 8.0))
+
+        feat_row = {
+            "days_to_arrival": dta,
+            "otb_occ_pct":     otb_occ,
+            "otb_rooms":       otb_rooms,
+            "remaining_pct":   remaining / capacity["total"] * 100,
+            "remaining_rooms": remaining,
+            "fill_rate":       fill_rate,
+            "pace_7d":         pace_7d,
+            "pace_7d_pct":     pace_7d  / capacity["total"] * 100,
+            "pace_14d":        pace_14d,
+            "pace_14d_pct":    pace_14d / capacity["total"] * 100,
+            "pace_30d":        pace_30d,
+            "pace_30d_pct":    pace_30d / capacity["total"] * 100,
+            "otb_std":         otb_std,
+            "otb_dlx":         otb_dlx,
+            "otb_ste":         otb_ste,
+            "otb_adr":         otb_adr,
+            "dow":             stay_date.dayofweek,
+            "month":           stay_date.month,
+            "week":            stay_date.isocalendar()[1],
+            "quarter":         stay_date.quarter,
+            "is_weekend":      int(stay_date.dayofweek >= 5),
+            "dom":             stay_date.day,
+            "doy":             stay_date.dayofyear,
+            "month_sin":       np.sin(2 * np.pi * stay_date.month / 12),
+            "month_cos":       np.cos(2 * np.pi * stay_date.month / 12),
+            "dow_sin":         np.sin(2 * np.pi * stay_date.dayofweek / 7),
+            "dow_cos":         np.cos(2 * np.pi * stay_date.dayofweek / 7),
+        }
+        X = pd.DataFrame([feat_row])[PICKUP_FEATURES]
+
+        pickup_lower = None if allow_wash else 0.0
+
+        if "pickup_occ_pct" in pickup_models:
+            pickup_occ_pct = float(np.clip(
+                pickup_models["pickup_occ_pct"].predict(X)[0],
+                pickup_lower, 100 - otb_occ,
+            ))
+        else:
+            pickup_occ_pct = 0.0
+
+        pickup_rooms = pickup_occ_pct * capacity["total"] / 100
+        pickup_rooms = (max(pickup_rooms, -otb_rooms) if allow_wash
+                        else min(max(pickup_rooms, 0.0), remaining))
+        pickup_occ_pct = pickup_rooms / capacity["total"] * 100
+
+        if "pickup_revenue" in pickup_models:
+            pickup_revenue = float(np.clip(
+                pickup_models["pickup_revenue"].predict(X)[0], pickup_lower, None
+            ))
+        else:
+            pickup_revenue = pickup_rooms * (otb_adr if otb_adr > 0 else 0.0)
+
+        total_rooms   = otb_rooms   + pickup_rooms
+        total_occ     = total_rooms / capacity["total"] * 100
+        total_revenue = otb_revenue + pickup_revenue
+        total_adr     = total_revenue / max(total_rooms, 1)
+
+        if "final_adr" in pickup_models:
+            total_adr = float(np.clip(
+                pickup_models["final_adr"].predict(X)[0], 0, None))
+        if "final_revenue" in pickup_models:
+            total_revenue = float(np.clip(
+                pickup_models["final_revenue"].predict(X)[0], 0, None))
+            total_adr = total_revenue / max(total_rooms, 1)
+
+        rem_std   = float(row_otb["remaining_std"])
+        rem_dlx   = float(row_otb["remaining_dlx"])
+        rem_ste   = float(row_otb["remaining_ste"])
+        rem_total = rem_std + rem_dlx + rem_ste
+        if rem_total > 0 and pickup_rooms != 0:
+            pickup_std = pickup_rooms * rem_std / rem_total
+            pickup_dlx = pickup_rooms * rem_dlx / rem_total
+            pickup_ste = pickup_rooms * rem_ste / rem_total
+        else:
+            pickup_std = pickup_dlx = pickup_ste = 0.0
+
+        total_std_occ = min(max((row_otb["std_otb"] + pickup_std) / capacity["Standard"] * 100, 0), 100)
+        total_dlx_occ = min(max((row_otb["dlx_otb"] + pickup_dlx) / capacity["Deluxe"]   * 100, 0), 100)
+        total_ste_occ = min(max((row_otb["ste_otb"] + pickup_ste) / capacity["Suite"]    * 100, 0), 100)
+
+        channel_preds = {}
+        for ch in channels:
+            channel_preds[ch] = (
+                otb_rooms * (
+                    otb_df[otb_df["stay_date"] == stay_date]
+                    .get(ch, pd.Series([0])).values[0]
+                ) / max(otb_rooms, 1)
+            ) if otb_rooms > 0 else 0.0
+
+        records.append({
+            "stay_date":       stay_date,
+            "otb_rooms":       otb_rooms,
+            "otb_occ_pct":     otb_occ,
+            "otb_revenue":     otb_revenue,
+            "otb_adr":         otb_adr,
+            "pickup_rooms":    pickup_rooms,
+            "pickup_occ_pct":  pickup_occ_pct,
+            "pickup_revenue":  pickup_revenue,
+            "model_occ_pct":   total_occ,
+            "model_revenue":   total_revenue,
+            "total_rooms":     total_rooms,
+            "total_occ_pct":   total_occ,
+            "total_revenue":   total_revenue,
+            "total_adr":       total_adr,
+            "total_revpar":    total_revenue / capacity["total"],
+            "remaining_rooms": remaining - pickup_rooms,
+            "total_std_occ":   total_std_occ,
+            "total_dlx_occ":   total_dlx_occ,
+            "total_ste_occ":   total_ste_occ,
+            **{ch: channel_preds.get(ch, 0) for ch in channels},
+        })
+
+    return pd.DataFrame(records)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OTB-ANCHORED FORECAST ENGINE (legacy fallback)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def forecast_otb_anchored(ts_models, feat_cols, ts_metrics, daily, otb_df, horizon=30):
@@ -1012,7 +1680,10 @@ if "current_user" not in st.session_state:
 for k in ("ts_models","ts_metrics","ts_feat_cols","ts_df","daily",
           "m_cancel","cancel_metrics","m_los","los_metrics","raw","expanded",
           "cv_results","drift_report","pending_models","pending_metrics",
-          "training_baseline_data","model_promotion_status"):
+          "training_baseline_data","model_promotion_status",
+          # Pickup v4 model artifacts
+          "pickup_models","pickup_metrics","pickup_df","pickup_cv",
+          "pending_pickup_models","pending_pickup_metrics"):
     if k not in st.session_state:
         st.session_state[k] = None
 
@@ -1179,27 +1850,78 @@ with st.sidebar:
             raw_proc, expanded = load_and_expand(uploaded)
             prog.progress(25, "Building daily aggregates…")
             daily = build_daily(expanded)
-            prog.progress(45, "Running walk-forward validation…")
+            prog.progress(45, "Running walk-forward validation (TS models)…")
             ts_models, ts_metrics, feat_cols, ts_df, cv_results = train_ts_models(daily)
-            prog.progress(80, "Training booking-level models…")
+            prog.progress(65, "Training pickup models (v4)…")
+            pickup_models, pickup_metrics, pickup_df, pickup_cv = train_pickup_models(
+                raw_proc, capacity=CAPACITY
+            )
+            prog.progress(85, "Training booking-level models…")
             m_c, cancel_met, m_l, los_met = train_booking_models(raw_proc)
             prog.progress(100, "Evaluating model quality…")
 
-            # Model promotion decision
-            old_metrics = st.session_state.ts_metrics
+            # Debug summary to explain quality-gate outcomes.
+            if pickup_metrics:
+                debug_rows = []
+                for target, label in PICKUP_TARGETS.items():
+                    if target in pickup_metrics:
+                        met = pickup_metrics[target]
+                        debug_rows.append({
+                            "target": label,
+                            "robust_r2": met.get("Robust_R2", met.get("R2", np.nan)),
+                            "robust_r2_std": met.get("Robust_R2_Std", np.nan),
+                            "mape": met.get("MAPE", np.nan),
+                            "mae": met.get("MAE", np.nan),
+                        })
+                debug_metrics_df = pd.DataFrame(debug_rows)
+            else:
+                debug_metrics_df = pd.DataFrame()
+
+            if pickup_df is not None and len(pickup_df) > 0:
+                fill_debug_df = pickup_df.copy()
+                fill_debug_df["month"] = fill_debug_df["stay_date"].dt.month
+                fill_rate_monthly = fill_debug_df.groupby("month")["fill_rate"].agg(
+                    count="count", mean="mean", std="std", min="min", max="max"
+                ).reset_index().sort_values("month")
+            else:
+                fill_rate_monthly = pd.DataFrame()
+
+            with st.expander("Debug: Pickup quality gate inputs", expanded=False):
+                st.caption("Per-target metrics used by the promotion gate")
+                if len(debug_metrics_df) > 0:
+                    st.dataframe(debug_metrics_df, use_container_width=True)
+                else:
+                    st.caption("No pickup metrics available.")
+
+                st.caption("Training fill_rate distribution by month")
+                if len(fill_rate_monthly) > 0:
+                    st.dataframe(fill_rate_monthly, use_container_width=True)
+                else:
+                    st.caption("No pickup training data available for fill_rate diagnostics.")
+
+            # Model promotion decision (based on pickup model quality as primary)
+            old_metrics = st.session_state.pickup_metrics
             promotion_reasons = []
             should_promote = True
 
-            if old_metrics is not None:
-                # Compare each target's robust R2
+            if old_metrics is not None and pickup_models:
+                # Compare pickup model quality
                 all_promotable = True
-                for t in TS_TARGETS:
-                    if t in old_metrics and t in ts_metrics:
-                        promote, reasons = should_promote_new_model(old_metrics[t], ts_metrics[t])
+                for t in PROMOTION_GATE_TARGETS:
+                    if t in old_metrics and t in pickup_metrics:
+                        promote, reasons = should_promote_new_model(old_metrics[t], pickup_metrics[t])
                         if not promote:
                             all_promotable = False
-                            promotion_reasons.extend([f"{LABEL_MAP.get(t, t)}: {r}" for r in reasons])
-
+                            promotion_reasons.extend([f"{PICKUP_TARGETS.get(t, t)}: {r}" for r in reasons])
+                # Keep non-gating targets visible for diagnostics.
+                non_gating_targets = [t for t in PICKUP_TARGETS.keys() if t not in PROMOTION_GATE_TARGETS]
+                for t in non_gating_targets:
+                    if t in old_metrics and t in pickup_metrics:
+                        promote, reasons = should_promote_new_model(old_metrics[t], pickup_metrics[t])
+                        if not promote:
+                            promotion_reasons.extend([
+                                f"[non-gating] {PICKUP_TARGETS.get(t, t)}: {r}" for r in reasons
+                            ])
                 should_promote = all_promotable
 
             # Update session state with promotion decision
@@ -1216,31 +1938,53 @@ with st.sidebar:
                 st.session_state.los_metrics = los_met
                 st.session_state.raw = raw_proc
                 st.session_state.expanded = expanded
+                # NEW: pickup model artifacts (v4 primary forecast path)
+                st.session_state.pickup_models = pickup_models
+                st.session_state.pickup_metrics = pickup_metrics
+                st.session_state.pickup_df = pickup_df
+                st.session_state.pickup_cv = pickup_cv
                 st.session_state.training_baseline_data = raw_proc.copy()
                 st.session_state.model_promotion_status = {
                     'promoted': True,
-                    'message': 'Models promoted to production',
+                    'message': 'Models promoted to production (pickup v4 primary)',
                     'reasons': promotion_reasons if promotion_reasons else ['Performance improved or maintained']
                 }
                 if st.session_state.current_user:
                     save_session(st.session_state.current_user, dict(st.session_state))
                 prog.empty()
-                st.success("✅ Models trained and promoted!")
+                st.success("✅ Models trained and promoted! (Pickup v4 active)")
             else:
                 # Store as pending, don't replace current models
                 st.session_state.pending_models = ts_models
                 st.session_state.pending_metrics = ts_metrics
+                st.session_state.pending_pickup_models = pickup_models
+                st.session_state.pending_pickup_metrics = pickup_metrics
                 st.session_state.model_promotion_status = {
                     'promoted': False,
                     'message': 'New models rejected - quality check failed',
                     'reasons': promotion_reasons
                 }
                 st.session_state.cv_results = cv_results
+                st.session_state.pickup_cv = pickup_cv
                 prog.empty()
                 st.error("❌ New models failed quality check. Previous models retained.")
 
     if st.session_state.ts_models:
         st.markdown("### 📊 Model Quality (Robust OOS)")
+        # Pickup v4 models (primary forecast path) - with Bias tracking
+        if st.session_state.pickup_metrics:
+            st.caption("**Pickup Models v4** (primary forecast)")
+            for t, label in PICKUP_TARGETS.items():
+                if t in st.session_state.pickup_metrics:
+                    m = st.session_state.pickup_metrics[t]
+                    robust_r2 = m.get('Robust_R2', m['R2'])
+                    r2_range = m.get('Expected_R2_Range', (robust_r2, robust_r2))
+                    bias = m.get('Bias', 0.0)
+                    st.caption(f"**{label}** "
+                              f"R²={robust_r2:.3f} (range: {r2_range[0]:.2f}-{r2_range[1]:.2f}) "
+                              f"MAE={m['MAE']:.2f} Bias={bias:+.2f}")
+        # Legacy TS models
+        st.caption("**Time-Series Models** (legacy)")
         for t in TS_TARGETS:
             if t in st.session_state.ts_metrics:
                 m = st.session_state.ts_metrics[t]
@@ -1253,7 +1997,7 @@ with st.sidebar:
         lm = st.session_state.los_metrics
         if cm: st.caption(f"**Cancellation** AUC={cm['AUC']:.3f}")
         if lm: st.caption(f"**LOS** MAE={lm['MAE']:.2f} nts Acc={lm['Accuracy']:.3f}")
-        st.caption("12 LightGBM • Walk-forward CV • Feature pruning • Drift-aware")
+        st.caption("12 LightGBM • Walk-forward CV • Feature pruning • Drift-aware • Pickup v4 with Bias tracking")
 
 # ── Guard ───────────────────────────────────────────────────────────────────────
 if st.session_state.ts_models is None:
@@ -1276,13 +2020,25 @@ m_los          = st.session_state.m_los
 los_metrics    = st.session_state.los_metrics
 raw            = st.session_state.raw
 expanded       = st.session_state.expanded
+# NEW: pickup v4 models (primary forecast path)
+pickup_models  = st.session_state.pickup_models
+pickup_metrics = st.session_state.pickup_metrics
 
 # ══════════════════════════════════════════════════════════════════════════════
 # COMPUTE OTB + FORECAST
 # ══════════════════════════════════════════════════════════════════════════════
 with st.spinner("Computing OTB and generating forecast…"):
     otb_df  = get_otb(raw, as_of_ts, horizon)
-    fcast   = forecast_otb_anchored(ts_models, feat_cols, ts_metrics, daily, otb_df, horizon)
+    # Use pickup v4 models as primary forecast path (allow_wash=True default)
+    if pickup_models:
+        fcast = forecast_with_pickup_models(
+            pickup_models, otb_df, as_of_ts,
+            raw=raw, capacity=CAPACITY, channels=CHANNELS,
+            allow_wash=True,
+        )
+    else:
+        # Fallback to legacy OTB-anchored forecast
+        fcast = forecast_otb_anchored(ts_models, feat_cols, ts_metrics, daily, otb_df, horizon)
 
 tomorrow_str = (as_of_ts + timedelta(days=1)).strftime("%d %b %Y")
 end_str      = (as_of_ts + timedelta(days=horizon)).strftime("%d %b %Y")
