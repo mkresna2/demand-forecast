@@ -852,6 +852,7 @@ def forecast_otb_anchored(ts_models, feat_cols, ts_metrics, daily, otb_df, horiz
     future_rows = []
     last_historical_date = df["stay_date"].max()
     forecast_start = otb_df["stay_date"].min()
+    _min_date = df["stay_date"].min()  # for days_from_start computation
 
     # Fill gap between last historical date and forecast start if any
     gap_dates = pd.date_range(start=last_historical_date + timedelta(days=1),
@@ -861,6 +862,12 @@ def forecast_otb_anchored(ts_models, feat_cols, ts_metrics, daily, otb_df, horiz
         for col in static_cols:
             if col in recent.columns:
                 row[col] = recent[col].mean()
+        # Override time features with correct values for this date
+        _ts = _add_time(pd.DataFrame({"stay_date": [d]}))
+        for _col in _ts.columns:
+            if _col != "stay_date" and _col in row:
+                row[_col] = _ts[_col].iloc[0]
+        row["days_from_start"] = (d - _min_date).days
         for t in all_ts_targets + ["revpar","rooms_occupied",
                                    "rooms_Standard","rooms_Deluxe","rooms_Suite"]:
             row[t] = recent_means[t]
@@ -888,6 +895,12 @@ def forecast_otb_anchored(ts_models, feat_cols, ts_metrics, daily, otb_df, horiz
             for col in static_cols:
                 if col in recent.columns:
                     new_row[col] = recent[col].mean()
+            # Override time features with correct values for this future date
+            _ts = _add_time(pd.DataFrame({"stay_date": [next_date]}))
+            for _col in _ts.columns:
+                if _col != "stay_date" and _col in new_row:
+                    new_row[_col] = _ts[_col].iloc[0]
+            new_row["days_from_start"] = (next_date - _min_date).days
             for t in all_ts_targets + ["revpar","rooms_occupied",
                                        "rooms_Standard","rooms_Deluxe","rooms_Suite"]:
                 new_row[t] = recent_means[t]
