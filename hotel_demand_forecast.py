@@ -1515,6 +1515,30 @@ def forecast_otb_anchored(ts_models, feat_cols, ts_metrics, daily, otb_df, horiz
                    {f"pct_{ch}" for ch in CHANNELS}
                    and "_lag" not in c and "_roll" not in c]
 
+    # Build seasonal seed lookup: (month, dow) -> avg per target
+    # Used to initialise future rows with seasonally-aware values rather than
+    # a flat recent average, which prevents the recursive lag chain from
+    # converging to the same constant for all far-future dates.
+    _seed_targets = (all_ts_targets +
+                     ["revpar", "rooms_occupied",
+                      "rooms_Standard", "rooms_Deluxe", "rooms_Suite"] +
+                     [f"pct_{ch}" for ch in CHANNELS])
+    _df_seed = df.copy()
+    _df_seed["_month"] = _df_seed["stay_date"].dt.month
+    _df_seed["_dow"]   = _df_seed["stay_date"].dt.dayofweek
+    _seasonal_seeds = {}
+    for _t in _seed_targets:
+        if _t in _df_seed.columns:
+            _seasonal_seeds[_t] = _df_seed.groupby(["_month", "_dow"])[_t].mean()
+
+    def _seed(t, date):
+        """Return seasonal avg for (month, dow), falling back to recent mean."""
+        key = (date.month, date.dayofweek)
+        if t in _seasonal_seeds and key in _seasonal_seeds[t].index:
+            val = _seasonal_seeds[t][key]
+            return float(val) if not pd.isna(val) else recent_means.get(t, 0.0)
+        return recent_means.get(t, 0.0)
+
     # Pre-extend history with future dates, initialized with recent averages
     # This ensures lag features have meaningful values, not zeros
     future_rows = []
@@ -1538,9 +1562,9 @@ def forecast_otb_anchored(ts_models, feat_cols, ts_metrics, daily, otb_df, horiz
         row["days_from_start"] = (d - _min_date).days
         for t in all_ts_targets + ["revpar","rooms_occupied",
                                    "rooms_Standard","rooms_Deluxe","rooms_Suite"]:
-            row[t] = recent_means[t]
+            row[t] = _seed(t, d)
         for ch in CHANNELS:
-            row[f"pct_{ch}"] = recent_means[f"pct_{ch}"]
+            row[f"pct_{ch}"] = _seed(f"pct_{ch}", d)
         future_rows.append(row)
 
     if future_rows:
@@ -1571,9 +1595,9 @@ def forecast_otb_anchored(ts_models, feat_cols, ts_metrics, daily, otb_df, horiz
             new_row["days_from_start"] = (next_date - _min_date).days
             for t in all_ts_targets + ["revpar","rooms_occupied",
                                        "rooms_Standard","rooms_Deluxe","rooms_Suite"]:
-                new_row[t] = recent_means[t]
+                new_row[t] = _seed(t, next_date)
             for ch in CHANNELS:
-                new_row[f"pct_{ch}"] = recent_means[f"pct_{ch}"]
+                new_row[f"pct_{ch}"] = _seed(f"pct_{ch}", next_date)
 
             history = pd.concat([history, pd.DataFrame([new_row])], ignore_index=True)
             idx = history.index[-1]
