@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(git add hotel_demand_forecast.py)",
-      "Bash(git commit:*)"
+      "Bash(git commit:*)",
+      "Bash(git add hotel_demand_forecast.py user_session.py)"
     ]
   }
 }
