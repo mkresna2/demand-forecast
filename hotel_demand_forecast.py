@@ -1561,7 +1561,53 @@ def forecast_with_pickup_models(
             **{ch: channel_preds.get(ch, 0) for ch in channels},
         })
 
-    return pd.DataFrame(records)
+    fcast_df = pd.DataFrame(records)
+
+    # FIX 13 — Degenerate prediction correction
+    # When the LightGBM pickup model produces constant output (< 3 unique values),
+    # the model has collapsed to a mean predictor within the inference DTA range.
+    # Apply a data-driven correction that preserves the model's average prediction
+    # but adds date-specific variation from:
+    #   (a) remaining capacity ratio — more remaining rooms → more pickup potential
+    #   (b) seasonal demand index — historically high-demand dates → more pickup
+    if len(fcast_df) >= 5:
+        pickup_unique = fcast_df["pickup_occ_pct"].round(1).nunique()
+        if pickup_unique < 3:
+            mean_pickup_occ = fcast_df["pickup_occ_pct"].mean()
+            mean_pickup_rev = fcast_df["pickup_revenue"].mean()
+            mean_remaining  = (capacity["total"] - fcast_df["otb_rooms"]).mean()
+
+            if mean_remaining > 0 and mean_pickup_occ > 0:
+                # Factor 1: remaining capacity ratio
+                remaining_factor = (capacity["total"] - fcast_df["otb_rooms"]) / mean_remaining
+
+                # Factor 2: seasonal demand index (month × dow from historical data)
+                if overall_hist_rev > 0:
+                    demand_factor = fcast_df["stay_date"].apply(
+                        lambda d: hist_rev_by_month_dow.get(
+                            (d.month, d.dayofweek), overall_hist_rev
+                        ) / overall_hist_rev
+                    )
+                else:
+                    demand_factor = pd.Series(1.0, index=fcast_df.index)
+
+                # Combined: geometric mean of factors, then normalize to preserve mean
+                combined = np.sqrt(remaining_factor * demand_factor)
+                combined = combined / combined.mean()  # mean-preserving
+
+                # Apply correction to pickup columns
+                fcast_df["pickup_occ_pct"] = mean_pickup_occ * combined
+                fcast_df["pickup_rooms"]   = fcast_df["pickup_occ_pct"] * capacity["total"] / 100
+                fcast_df["pickup_revenue"] = mean_pickup_rev * combined
+
+                # Recalculate totals
+                fcast_df["total_rooms"]   = fcast_df["otb_rooms"] + fcast_df["pickup_rooms"]
+                fcast_df["total_occ_pct"] = fcast_df["total_rooms"] / capacity["total"] * 100
+                fcast_df["total_revenue"] = fcast_df["otb_revenue"] + fcast_df["pickup_revenue"]
+                fcast_df["total_adr"]     = fcast_df["total_revenue"] / fcast_df["total_rooms"].clip(lower=1)
+                fcast_df["total_revpar"]  = fcast_df["total_revenue"] / capacity["total"]
+
+    return fcast_df
 
 
 # ══════════════════════════════════════════════════════════════════════════════
