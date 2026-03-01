@@ -839,6 +839,11 @@ PICKUP_FEATURES = [
     "month_cos",
     "dow_sin",
     "dow_cos",
+    # Historical baselines — give the model date-specific seasonal signal
+    # so it can differentiate dates even within a narrow DTA range.
+    "hist_occ_dow",          # avg final occ for this day-of-week
+    "hist_occ_month",        # avg final occ for this month
+    "hist_rev_month_dow",    # avg final revenue for this month × dow
 ]
 
 PICKUP_TARGETS = {
@@ -1029,6 +1034,16 @@ def build_pickup_training_data(
         conf, capacity["total"], lead_days_max=90
     )
 
+    # FIX 11: Historical baseline features — seasonal signal per DOW / month
+    _hist = finals.copy()
+    _hist["_dow"]   = pd.to_datetime(_hist["stay_date"]).dt.dayofweek
+    _hist["_month"] = pd.to_datetime(_hist["stay_date"]).dt.month
+    hist_occ_by_dow       = _hist.groupby("_dow")["final_occ_pct"].mean().to_dict()
+    hist_occ_by_month     = _hist.groupby("_month")["final_occ_pct"].mean().to_dict()
+    hist_rev_by_month_dow = _hist.groupby(["_month", "_dow"])["final_revenue"].mean().to_dict()
+    overall_hist_occ      = float(_hist["final_occ_pct"].mean())
+    overall_hist_rev      = float(_hist["final_revenue"].mean())
+
     records = []
     for stay_date in finals["stay_date"].values:
         stay_ts        = pd.Timestamp(stay_date)
@@ -1107,6 +1122,10 @@ def build_pickup_training_data(
                 "month_cos":       np.cos(2 * np.pi * stay_ts.month / 12),
                 "dow_sin":         np.sin(2 * np.pi * stay_ts.dayofweek / 7),
                 "dow_cos":         np.cos(2 * np.pi * stay_ts.dayofweek / 7),
+                "hist_occ_dow":       hist_occ_by_dow.get(stay_ts.dayofweek, overall_hist_occ),
+                "hist_occ_month":     hist_occ_by_month.get(stay_ts.month, overall_hist_occ),
+                "hist_rev_month_dow": hist_rev_by_month_dow.get(
+                    (stay_ts.month, stay_ts.dayofweek), overall_hist_rev),
                 "pickup_rooms":    pickup_rooms,
                 "pickup_occ_pct":  pickup_occ_pct,
                 "pickup_revenue":  pickup_revenue,
@@ -1260,7 +1279,7 @@ def train_pickup_models(
         m = lgb.LGBMRegressor(**params)
         m.fit(X_train, y_train,
               eval_set=[(X_test, y_test)],
-              callbacks=[lgb.early_stopping(100, verbose=False)])
+              callbacks=[lgb.early_stopping(300, verbose=False)])
 
         # FIX 2: no clip at eval — measure true error including wash days
         preds = m.predict(X_test)
@@ -1318,6 +1337,37 @@ def forecast_with_pickup_models(
     # FIX 3 — real pace, computed once before the loop
     pace_df     = _compute_inference_pace(raw, as_of_date, capacity["total"])
     pace_lookup = pace_df.set_index("stay_date").to_dict("index") if len(pace_df) > 0 else {}
+
+    # FIX 11 — Historical baselines (seasonal signal per DOW / month)
+    _conf_hist = raw[raw["Cancellation_Status"] == "Confirmed"].copy()
+    _conf_hist["Check_in_Date"]  = pd.to_datetime(_conf_hist["Check_in_Date"])
+    _conf_hist["Check_out_Date"] = pd.to_datetime(_conf_hist["Check_out_Date"])
+    _hist_rows = []
+    for _, _r in _conf_hist.iterrows():
+        for _d in pd.date_range(_r["Check_in_Date"],
+                                _r["Check_out_Date"] - timedelta(days=1)):
+            _hist_rows.append({
+                "stay_date": _d,
+                "Booked_Rate": _r["Booked_Rate"],
+            })
+    if _hist_rows:
+        _hdf = pd.DataFrame(_hist_rows)
+        _h_agg = _hdf.groupby("stay_date").agg(
+            final_rooms   = ("Booked_Rate", "count"),
+            final_revenue = ("Booked_Rate", "sum"),
+        ).reset_index()
+        _h_agg["final_occ_pct"] = _h_agg["final_rooms"] / capacity["total"] * 100
+        _h_agg["_dow"]   = pd.to_datetime(_h_agg["stay_date"]).dt.dayofweek
+        _h_agg["_month"] = pd.to_datetime(_h_agg["stay_date"]).dt.month
+        hist_occ_by_dow       = _h_agg.groupby("_dow")["final_occ_pct"].mean().to_dict()
+        hist_occ_by_month     = _h_agg.groupby("_month")["final_occ_pct"].mean().to_dict()
+        hist_rev_by_month_dow = _h_agg.groupby(["_month", "_dow"])["final_revenue"].mean().to_dict()
+        overall_hist_occ      = float(_h_agg["final_occ_pct"].mean())
+        overall_hist_rev      = float(_h_agg["final_revenue"].mean())
+    else:
+        hist_occ_by_dow = hist_occ_by_month = {}
+        hist_rev_by_month_dow = {}
+        overall_hist_occ = overall_hist_rev = 0.0
 
     # Compute month-aware pace baselines for fill_rate — mirrors training computation
     conf      = raw[raw["Cancellation_Status"] == "Confirmed"].copy()
@@ -1422,6 +1472,10 @@ def forecast_with_pickup_models(
             "month_cos":       np.cos(2 * np.pi * stay_date.month / 12),
             "dow_sin":         np.sin(2 * np.pi * stay_date.dayofweek / 7),
             "dow_cos":         np.cos(2 * np.pi * stay_date.dayofweek / 7),
+            "hist_occ_dow":       hist_occ_by_dow.get(stay_date.dayofweek, overall_hist_occ),
+            "hist_occ_month":     hist_occ_by_month.get(stay_date.month, overall_hist_occ),
+            "hist_rev_month_dow": hist_rev_by_month_dow.get(
+                (stay_date.month, stay_date.dayofweek), overall_hist_rev),
         }
         X = pd.DataFrame([feat_row])[PICKUP_FEATURES]
 
