@@ -60,18 +60,20 @@ def init_db() -> None:
                 los_metrics_text TEXT,
                 pickup_models_blob BLOB,
                 pickup_metrics_text TEXT,
+                pickup_df_blob BLOB,
                 updated_at TEXT
             )
         """)
         # Migration: add pickup columns to existing tables
-        try:
-            conn.execute("ALTER TABLE user_sessions ADD COLUMN pickup_models_blob BLOB")
-        except sqlite3.OperationalError:
-            pass  # column already exists
-        try:
-            conn.execute("ALTER TABLE user_sessions ADD COLUMN pickup_metrics_text TEXT")
-        except sqlite3.OperationalError:
-            pass  # column already exists
+        for col, ctype in [
+            ("pickup_models_blob", "BLOB"),
+            ("pickup_metrics_text", "TEXT"),
+            ("pickup_df_blob", "BLOB"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE user_sessions ADD COLUMN {col} {ctype}")
+            except sqlite3.OperationalError:
+                pass  # column already exists
         conn.commit()
 
 
@@ -137,21 +139,23 @@ def save_session(username: str, state: dict) -> None:
         if pickup_metrics else None
     )
 
+    pickup_df_blob = _serialize_df(state.get("pickup_df"))
+
     with _get_conn() as conn:
         conn.execute("""
             INSERT OR REPLACE INTO user_sessions (
                 username, raw_blob, expanded_blob, daily_blob, ts_df_blob,
                 ts_models_blob, ts_metrics_text, ts_feat_cols_text,
                 m_cancel_blob, cancel_metrics_text, m_los_blob, los_metrics_text,
-                pickup_models_blob, pickup_metrics_text,
+                pickup_models_blob, pickup_metrics_text, pickup_df_blob,
                 updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             username,
             raw_blob, expanded_blob, daily_blob, ts_df_blob,
             ts_models_blob, ts_metrics_text, ts_feat_cols_text,
             m_cancel_blob, cancel_metrics_text, m_los_blob, los_metrics_text,
-            pickup_models_blob, pickup_metrics_text,
+            pickup_models_blob, pickup_metrics_text, pickup_df_blob,
             now,
         ))
         conn.commit()
@@ -189,6 +193,8 @@ def load_session(username: str) -> Optional[dict]:
     state["pickup_models"] = pickle.loads(pm_blob) if pm_blob else None
     pm_text = row["pickup_metrics_text"] if "pickup_metrics_text" in row.keys() else None
     state["pickup_metrics"] = _load_metrics_text(pm_text)
+    pdf_blob = row["pickup_df_blob"] if "pickup_df_blob" in row.keys() else None
+    state["pickup_df"] = _deserialize_df(pdf_blob)
 
     return state
 

@@ -1319,11 +1319,20 @@ def forecast_with_pickup_models(
     pace_df     = _compute_inference_pace(raw, as_of_date, capacity["total"])
     pace_lookup = pace_df.set_index("stay_date").to_dict("index") if len(pace_df) > 0 else {}
 
-    # FIX 7 — DTA-aware pace fallback from training data
+    # Compute month-aware pace baselines for fill_rate — mirrors training computation
+    conf      = raw[raw["Cancellation_Status"] == "Confirmed"].copy()
+    conf["Check_in_Date"] = pd.to_datetime(conf["Check_in_Date"])
+    conf["Booking_Date"]  = pd.to_datetime(conf["Booking_Date"])
+    monthly_pace, global_pace = _compute_monthly_pace_baselines(
+        conf, capacity["total"], lead_days_max=90
+    )
+
+    # FIX 7+10 — DTA-aware pace fallback from training data, with monthly_pace safety net.
     # During training, pace features are non-zero (historical bookings exist).
     # At inference, dates without recent bookings get pace=0, causing
     # distribution shift that pushes all dates into the same LightGBM leaf.
-    # Fix: use training-mean pace for the nearest DTA as fallback.
+    # Primary fallback: training-mean pace per DTA from pickup_df.
+    # Secondary fallback: monthly_pace * window_days * capacity (always available).
     _pf = st.session_state.get("pickup_df")
     if _pf is not None and len(_pf) > 0:
         _pace_cols = ["pace_7d", "pace_14d", "pace_30d"]
@@ -1335,26 +1344,27 @@ def forecast_with_pickup_models(
     else:
         pace_fallback_df = pd.DataFrame()
 
-    def _get_pace_fallback(dta_val):
-        """Return training-mean pace for the nearest DTA in pickup training data."""
-        if pace_fallback_df.empty:
-            return 0.0, 0.0, 0.0
-        idx = pace_fallback_df.index
-        nearest = idx[np.abs(idx - dta_val).argmin()]
-        row = pace_fallback_df.loc[nearest]
+    def _get_pace_fallback(dta_val, month_num):
+        """Return pace fallback: training-mean if available, else monthly_pace-based."""
+        if not pace_fallback_df.empty:
+            idx = pace_fallback_df.index
+            nearest = idx[np.abs(idx - dta_val).argmin()]
+            row_fb = pace_fallback_df.loc[nearest]
+            return (
+                float(row_fb.get("pace_7d",  0.0)),
+                float(row_fb.get("pace_14d", 0.0)),
+                float(row_fb.get("pace_30d", 0.0)),
+            )
+        # Secondary fallback: approximate pace from monthly booking rate.
+        # Closer to stay date = higher booking velocity, so apply DTA scaling.
+        mp = monthly_pace.get(month_num, global_pace)
+        dta_scale = max(1.0, (90 - dta_val) / 45)  # ramps up as DTA shrinks
+        daily_rooms = mp * capacity["total"] * dta_scale
         return (
-            float(row.get("pace_7d",  0.0)),
-            float(row.get("pace_14d", 0.0)),
-            float(row.get("pace_30d", 0.0)),
+            daily_rooms * 7,
+            daily_rooms * 14,
+            daily_rooms * 30,
         )
-
-    # Compute month-aware pace baselines for fill_rate — mirrors training computation
-    conf      = raw[raw["Cancellation_Status"] == "Confirmed"].copy()
-    conf["Check_in_Date"] = pd.to_datetime(conf["Check_in_Date"])
-    conf["Booking_Date"]  = pd.to_datetime(conf["Booking_Date"])
-    monthly_pace, global_pace = _compute_monthly_pace_baselines(
-        conf, capacity["total"], lead_days_max=90
-    )
 
     records = []
     for _, row_otb in otb_df.reset_index(drop=True).iterrows():
@@ -1376,7 +1386,7 @@ def forecast_with_pickup_models(
             pace_14d = float(pace_entry.get("pace_14d", 0.0))
             pace_30d = float(pace_entry.get("pace_30d", 0.0))
         else:
-            pace_7d, pace_14d, pace_30d = _get_pace_fallback(dta)
+            pace_7d, pace_14d, pace_30d = _get_pace_fallback(dta, stay_date.month)
 
         days_elapsed       = max(90 - dta, 0)
         month_pace         = monthly_pace.get(stay_date.month, global_pace)
