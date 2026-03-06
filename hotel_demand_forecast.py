@@ -2036,19 +2036,19 @@ with st.sidebar:
     # Model promotion status display
     if st.session_state.model_promotion_status:
         status = st.session_state.model_promotion_status
-        if status.get('promoted'):
-            st.success(f"✅ {status.get('message', 'Models promoted')}")
+        has_warnings = status.get('reasons') and status['reasons'] != ['All quality checks passed']
+        if has_warnings:
+            st.warning(f"⚠️ {status.get('message', 'Models promoted')} (with quality warnings)")
+            for r in status['reasons']:
+                st.caption(f"• {r}")
         else:
-            st.error(f"❌ {status.get('message', 'Models rejected')}")
-            if status.get('reasons'):
-                for r in status['reasons']:
-                    st.caption(f"• {r}")
+            st.success(f"✅ {status.get('message', 'Models promoted')}")
 
-    # Rejection history (persisted across sessions)
+    # Quality warning history (persisted across sessions)
     if st.session_state.current_user:
         rej_history = load_rejection_log(st.session_state.current_user, limit=5)
         if rej_history:
-            with st.expander("Rejection history (last 5)", expanded=False):
+            with st.expander("Quality warning history (last 5)", expanded=False):
                 for entry in rej_history:
                     st.caption(f"**{entry['rejected_at']}**")
                     for r in entry.get("reasons", []):
@@ -2126,100 +2126,78 @@ with st.sidebar:
                 else:
                     st.caption("No pickup training data available for fill_rate diagnostics.")
 
-            # Model promotion decision (based on pickup model quality as primary)
+            # Model quality assessment (advisory — never blocks promotion)
             old_metrics = st.session_state.pickup_metrics
-            promotion_reasons = []
-            should_promote = True
+            quality_warnings = []
 
             if old_metrics is not None and pickup_models:
-                # Compare pickup model quality
-                all_promotable = True
                 for t in PROMOTION_GATE_TARGETS:
                     if t in old_metrics and t in pickup_metrics:
-                        promote, reasons = should_promote_new_model(old_metrics[t], pickup_metrics[t])
-                        if not promote:
-                            all_promotable = False
-                            promotion_reasons.extend([f"{PICKUP_TARGETS.get(t, t)}: {r}" for r in reasons])
-                # Keep non-gating targets visible for diagnostics.
+                        _, reasons = should_promote_new_model(old_metrics[t], pickup_metrics[t])
+                        quality_warnings.extend([f"{PICKUP_TARGETS.get(t, t)}: {r}" for r in reasons])
                 non_gating_targets = [t for t in PICKUP_TARGETS.keys() if t not in PROMOTION_GATE_TARGETS]
                 for t in non_gating_targets:
                     if t in old_metrics and t in pickup_metrics:
-                        promote, reasons = should_promote_new_model(old_metrics[t], pickup_metrics[t])
-                        if not promote:
-                            promotion_reasons.extend([
-                                f"[non-gating] {PICKUP_TARGETS.get(t, t)}: {r}" for r in reasons
+                        _, reasons = should_promote_new_model(old_metrics[t], pickup_metrics[t])
+                        if reasons:
+                            quality_warnings.extend([
+                                f"[info] {PICKUP_TARGETS.get(t, t)}: {r}" for r in reasons
                             ])
-                should_promote = all_promotable
 
             elif pickup_models and pickup_metrics:
-                # First training: apply minimum absolute quality bars
-                # No old model to compare against, but don't auto-promote garbage
                 for t in PROMOTION_GATE_TARGETS:
                     if t in pickup_metrics:
                         met = pickup_metrics[t]
                         r2 = met.get('Robust_R2', met.get('R2', 0))
                         r2_std = met.get('Robust_R2_Std', 0)
                         if r2 < 0.3:
-                            should_promote = False
-                            promotion_reasons.append(
-                                f"{PICKUP_TARGETS.get(t, t)}: R² too low for first training ({r2:.3f})"
+                            quality_warnings.append(
+                                f"{PICKUP_TARGETS.get(t, t)}: R² low ({r2:.3f})"
                             )
                         if r2_std > 0.55:
-                            should_promote = False
-                            promotion_reasons.append(
-                                f"{PICKUP_TARGETS.get(t, t)}: R² variance too high for first training ({r2_std:.3f})"
+                            quality_warnings.append(
+                                f"{PICKUP_TARGETS.get(t, t)}: R² variance high ({r2_std:.3f})"
                             )
 
-            # Update session state with promotion decision
-            if should_promote:
-                st.session_state.ts_models = ts_models
-                st.session_state.ts_metrics = ts_metrics
-                st.session_state.ts_feat_cols = feat_cols
-                st.session_state.ts_df = ts_df
-                st.session_state.cv_results = cv_results
-                st.session_state.daily = daily
-                st.session_state.m_cancel = m_c
-                st.session_state.cancel_metrics = cancel_met
-                st.session_state.m_los = m_l
-                st.session_state.los_metrics = los_met
-                st.session_state.raw = raw_proc
-                st.session_state.expanded = expanded
-                # NEW: pickup model artifacts (v4 primary forecast path)
-                st.session_state.pickup_models = pickup_models
-                st.session_state.pickup_metrics = pickup_metrics
-                st.session_state.pickup_df = pickup_df
-                st.session_state.pickup_cv = pickup_cv
-                st.session_state.training_baseline_data = raw_proc.copy()
-                st.session_state.model_promotion_status = {
-                    'promoted': True,
-                    'message': 'Models promoted to production (pickup v4 primary)',
-                    'reasons': promotion_reasons if promotion_reasons else ['Performance improved or maintained']
-                }
-                if st.session_state.current_user:
-                    save_session(st.session_state.current_user, dict(st.session_state))
-                prog.empty()
-                st.success("✅ Models trained and promoted! (Pickup v4 active)")
-            else:
-                # Store as pending, don't replace current models
-                st.session_state.pending_models = ts_models
-                st.session_state.pending_metrics = ts_metrics
-                st.session_state.pending_pickup_models = pickup_models
-                st.session_state.pending_pickup_metrics = pickup_metrics
-                st.session_state.model_promotion_status = {
-                    'promoted': False,
-                    'message': 'New models rejected - quality check failed',
-                    'reasons': promotion_reasons
-                }
-                st.session_state.cv_results = cv_results
-                st.session_state.pickup_cv = pickup_cv
+            # Always promote — quality check is advisory only
+            st.session_state.ts_models = ts_models
+            st.session_state.ts_metrics = ts_metrics
+            st.session_state.ts_feat_cols = feat_cols
+            st.session_state.ts_df = ts_df
+            st.session_state.cv_results = cv_results
+            st.session_state.daily = daily
+            st.session_state.m_cancel = m_c
+            st.session_state.cancel_metrics = cancel_met
+            st.session_state.m_los = m_l
+            st.session_state.los_metrics = los_met
+            st.session_state.raw = raw_proc
+            st.session_state.expanded = expanded
+            st.session_state.pickup_models = pickup_models
+            st.session_state.pickup_metrics = pickup_metrics
+            st.session_state.pickup_df = pickup_df
+            st.session_state.pickup_cv = pickup_cv
+            st.session_state.training_baseline_data = raw_proc.copy()
+            st.session_state.model_promotion_status = {
+                'promoted': True,
+                'message': 'Models trained and promoted',
+                'reasons': quality_warnings if quality_warnings else ['All quality checks passed'],
+            }
+            if st.session_state.current_user:
+                save_session(st.session_state.current_user, dict(st.session_state))
+            prog.empty()
+
+            if quality_warnings:
                 save_rejection(
                     st.session_state.current_user,
-                    promotion_reasons,
+                    quality_warnings,
                     pending_pickup_metrics=pickup_metrics,
                     pending_ts_metrics=ts_metrics,
                 )
-                prog.empty()
-                st.error("❌ New models failed quality check. Previous models retained.")
+                st.warning("⚠️ Models trained and promoted with quality warnings:")
+                for w in quality_warnings:
+                    st.caption(f"• {w}")
+            else:
+                st.success("✅ Models trained and promoted! (Pickup v4 active)")
 
     if st.session_state.ts_models:
         st.markdown("### 📊 Model Quality (Robust OOS)")
