@@ -222,6 +222,76 @@ def list_users() -> list[str]:
     return [r[0] for r in rows]
 
 
+def _init_rejection_log() -> None:
+    """Create rejection_log table if it does not exist."""
+    with _get_conn() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS rejection_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT,
+                rejected_at TEXT,
+                reasons_json TEXT,
+                pending_pickup_metrics_text TEXT,
+                pending_ts_metrics_text TEXT
+            )
+        """)
+        conn.commit()
+
+
+def save_rejection(username: str, reasons: list,
+                   pending_pickup_metrics: dict | None = None,
+                   pending_ts_metrics: dict | None = None) -> None:
+    """Persist a rejection event with reasons and candidate metrics."""
+    import datetime
+    _init_rejection_log()
+    now = datetime.datetime.utcnow().isoformat() + "Z"
+
+    reasons_json = json.dumps(reasons, default=_json_default)
+
+    pp_text = (
+        base64.b64encode(pickle.dumps(pending_pickup_metrics)).decode("ascii")
+        if pending_pickup_metrics else None
+    )
+    ts_text = (
+        json.dumps(pending_ts_metrics, default=_json_default)
+        if pending_ts_metrics else None
+    )
+
+    with _get_conn() as conn:
+        conn.execute("""
+            INSERT INTO rejection_log
+                (username, rejected_at, reasons_json,
+                 pending_pickup_metrics_text, pending_ts_metrics_text)
+            VALUES (?, ?, ?, ?, ?)
+        """, (username or "anonymous", now, reasons_json, pp_text, ts_text))
+        conn.commit()
+
+
+def load_rejection_log(username: str, limit: int = 10) -> list[dict]:
+    """Return the most recent rejection events for a user."""
+    _init_rejection_log()
+    with _get_conn() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT rejected_at, reasons_json, pending_pickup_metrics_text "
+            "FROM rejection_log WHERE username = ? "
+            "ORDER BY id DESC LIMIT ?",
+            (username or "anonymous", limit),
+        ).fetchall()
+
+    results = []
+    for row in rows:
+        entry: dict = {
+            "rejected_at": row["rejected_at"],
+            "reasons": json.loads(row["reasons_json"]) if row["reasons_json"] else [],
+        }
+        pm_text = row["pending_pickup_metrics_text"]
+        if pm_text:
+            entry["pending_pickup_metrics"] = pickle.loads(base64.b64decode(pm_text))
+        results.append(entry)
+    return results
+
+
 def delete_session(username: str) -> bool:
     """Delete saved session for the given username. Returns True if deleted, False if not found."""
     init_db()

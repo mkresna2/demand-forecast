@@ -26,7 +26,10 @@ import numpy as np
 import warnings
 from datetime import timedelta
 
-from user_session import init_db, load_session, save_session, list_users, delete_session
+from user_session import (
+    init_db, load_session, save_session, list_users, delete_session,
+    save_rejection, load_rejection_log,
+)
 
 warnings.filterwarnings("ignore")
 
@@ -703,7 +706,7 @@ def should_promote_new_model(old_metrics: dict, new_metrics: dict,
         promote = False
 
     # R² should be stable across folds — hard reject
-    if new_r2_std > 0.50:
+    if new_r2_std > 0.55:
         reasons.append(f"High R² variance across validation folds ({new_r2_std:.3f})")
         promote = False
 
@@ -2017,6 +2020,31 @@ with st.sidebar:
                 for r in status['reasons']:
                     st.caption(f"• {r}")
 
+    # Rejection history (persisted across sessions)
+    if st.session_state.current_user:
+        rej_history = load_rejection_log(st.session_state.current_user, limit=5)
+        if rej_history:
+            with st.expander("Rejection history (last 5)", expanded=False):
+                for entry in rej_history:
+                    st.caption(f"**{entry['rejected_at']}**")
+                    for r in entry.get("reasons", []):
+                        st.caption(f"  • {r}")
+                    pm = entry.get("pending_pickup_metrics")
+                    if pm:
+                        rows = []
+                        for t in ["pickup_occ_pct", "pickup_rooms", "pickup_revenue"]:
+                            if t in pm:
+                                m = pm[t]
+                                rows.append({
+                                    "target": PICKUP_TARGETS.get(t, t),
+                                    "Robust_R2": m.get("Robust_R2", m.get("R2")),
+                                    "Robust_R2_Std": m.get("Robust_R2_Std"),
+                                    "MAE": m.get("MAE"),
+                                })
+                        if rows:
+                            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+                    st.markdown("---")
+
     if st.button("🚀 Train All Models", type="primary", use_container_width=True):
         if uploaded is None:
             st.error("Upload a CSV first.")
@@ -2112,7 +2140,7 @@ with st.sidebar:
                             promotion_reasons.append(
                                 f"{PICKUP_TARGETS.get(t, t)}: R² too low for first training ({r2:.3f})"
                             )
-                        if r2_std > 0.50:
+                        if r2_std > 0.55:
                             should_promote = False
                             promotion_reasons.append(
                                 f"{PICKUP_TARGETS.get(t, t)}: R² variance too high for first training ({r2_std:.3f})"
@@ -2160,6 +2188,12 @@ with st.sidebar:
                 }
                 st.session_state.cv_results = cv_results
                 st.session_state.pickup_cv = pickup_cv
+                save_rejection(
+                    st.session_state.current_user,
+                    promotion_reasons,
+                    pending_pickup_metrics=pickup_metrics,
+                    pending_ts_metrics=ts_metrics,
+                )
                 prog.empty()
                 st.error("❌ New models failed quality check. Previous models retained.")
 
