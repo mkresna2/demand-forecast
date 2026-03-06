@@ -686,11 +686,18 @@ def should_promote_new_model(old_metrics: dict, new_metrics: dict,
     """
     Determine if new model should replace old model based on robust metrics.
 
+    Gate logic (applied in order):
+    1. Hard floor: reject if Robust R² < 0.30
+    2. MAE regression: reject if MAE more than doubled
+    3. R² regression + fold variance: assessed together, but waived when
+       MAE improved significantly AND R² remains strong (>= 0.85).
+       This prevents vetoing a model that makes smaller real-world errors
+       just because walk-forward CV folds are noisy.
+
     Returns: (should_promote: bool, reasons: list)
     """
     reasons = []
 
-    # Compare robust R2 (median from walk-forward CV)
     old_r2     = old_metrics.get('Robust_R2', old_metrics.get('R2', 0))
     new_r2     = new_metrics.get('Robust_R2', new_metrics.get('R2', 0))
     new_r2_std = new_metrics.get('Robust_R2_Std', 0)
@@ -699,15 +706,15 @@ def should_promote_new_model(old_metrics: dict, new_metrics: dict,
     new_mae = new_metrics.get('MAE', float('inf'))
 
     promote = True
+    r2_dropped = new_r2 < old_r2 - r2_tolerance
+    high_variance = new_r2_std > 0.55
 
-    # R² should not drop significantly
-    if new_r2 < old_r2 - r2_tolerance:
-        reasons.append(f"Robust R² dropped significantly ({new_r2:.3f} vs {old_r2:.3f})")
-        promote = False
+    mae_improved = old_mae > 0 and new_mae < old_mae * 0.75
+    r2_still_strong = new_r2 >= 0.85
 
-    # R² should be stable across folds — hard reject
-    if new_r2_std > 0.55:
-        reasons.append(f"High R² variance across validation folds ({new_r2_std:.3f})")
+    # Hard floor -- always enforced
+    if new_r2 < 0.3:
+        reasons.append(f"Robust R² below minimum threshold ({new_r2:.3f})")
         promote = False
 
     # MAE should not regress catastrophically
@@ -715,10 +722,27 @@ def should_promote_new_model(old_metrics: dict, new_metrics: dict,
         reasons.append(f"MAE more than doubled ({new_mae:.2f} vs {old_mae:.2f})")
         promote = False
 
-    # Minimum quality bar
-    if new_r2 < 0.3:
-        reasons.append(f"Robust R² below minimum threshold ({new_r2:.3f})")
-        promote = False
+    # R² regression and fold variance: soft-gate when MAE clearly improved
+    if r2_dropped or high_variance:
+        if mae_improved and r2_still_strong:
+            if r2_dropped:
+                reasons.append(
+                    f"R² dropped ({new_r2:.3f} vs {old_r2:.3f}) "
+                    f"but waived: MAE improved ({new_mae:.2f} vs {old_mae:.2f}) "
+                    f"and R² still strong"
+                )
+            if high_variance:
+                reasons.append(
+                    f"High fold variance ({new_r2_std:.3f}) "
+                    f"but waived: MAE improved and R² still strong ({new_r2:.3f})"
+                )
+        else:
+            if r2_dropped:
+                reasons.append(f"Robust R² dropped significantly ({new_r2:.3f} vs {old_r2:.3f})")
+                promote = False
+            if high_variance:
+                reasons.append(f"High R² variance across validation folds ({new_r2_std:.3f})")
+                promote = False
 
     if promote:
         if new_r2 > old_r2 + 0.01:
